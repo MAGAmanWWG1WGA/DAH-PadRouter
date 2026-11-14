@@ -1,0 +1,68 @@
+name: Build DAHPadRouter
+
+on:
+  workflow_dispatch:
+    inputs:
+      ue4ss_ref:
+        description: "RE-UE4SS commit or tag to build against (must match the UE4SS in the game)"
+        default: "1ceefac8"
+  push:
+    paths:
+      - "DAHPadRouter/**"
+      - "xmake.lua"
+      - ".github/workflows/build.yml"
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - name: Check out this repo
+        uses: actions/checkout@v4
+
+      - name: Let git use your token (needed for UE4SS's private Unreal submodule)
+        shell: pwsh
+        env:
+          TOKEN: ${{ secrets.UE4SS_GIT_TOKEN }}
+        run: |
+          if (-not $env:TOKEN) { Write-Error "The UE4SS_GIT_TOKEN secret is missing (see README step 4)"; exit 1 }
+          git config --global url."https://x-access-token:$($env:TOKEN)@github.com/".insteadOf "https://github.com/"
+          git config --global --add url."https://x-access-token:$($env:TOKEN)@github.com/".insteadOf "git@github.com:"
+
+      - name: Download RE-UE4SS
+        shell: pwsh
+        run: |
+          $ref = "${{ github.event.inputs.ue4ss_ref }}"
+          if (-not $ref) { $ref = "1ceefac8" }
+          git clone https://github.com/UE4SS-RE/RE-UE4SS.git RE-UE4SS
+          cd RE-UE4SS
+          git checkout $ref
+          if ($LASTEXITCODE -ne 0) { Write-Error "UE4SS version '$ref' not found"; exit 1 }
+          git submodule update --init --recursive
+          if ($LASTEXITCODE -ne 0) { Write-Error "Submodule download failed: is your GitHub account linked to Epic and the token correct? (README steps 1-4)"; exit 1 }
+
+      - name: Install xmake
+        uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: latest
+
+      - name: Build
+        shell: pwsh
+        run: |
+          xmake f -m "Game__Shipping__Win64" -y
+          xmake build -y DAHPadRouter
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem -Recurse -Filter DAHPadRouter.dll | Select-Object -First 1
+          if (-not $dll) { Write-Error "DAHPadRouter.dll was not produced"; exit 1 }
+          New-Item -ItemType Directory -Force out/DAHPadRouter/dlls | Out-Null
+          Copy-Item $dll.FullName out/DAHPadRouter/dlls/main.dll
+          Copy-Item DAHPadRouter/config.txt out/DAHPadRouter/dlls/config.txt
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: DAHPadRouter
+          path: out/

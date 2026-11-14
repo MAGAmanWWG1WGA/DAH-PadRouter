@@ -49,8 +49,21 @@ jobs:
       - name: Build
         shell: pwsh
         run: |
-          xmake f -m "Game__Shipping__Win64" -y
+          $ok = $false
+          for ($i = 1; $i -le 3; $i++) {
+            xmake f -m "Game__Shipping__Win64" -y
+            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            Write-Host "::warning::Package setup attempt $i failed, retrying"
+          }
+          if (-not $ok) {
+            Write-Host "===== Package install logs ====="
+            Get-ChildItem "$env:LOCALAPPDATA\.xmake\cache\packages" -Recurse -Filter install.txt -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -like '*installdir.failed*' } |
+              ForEach-Object { Write-Host "===== $($_.FullName)"; Get-Content $_.FullName -Tail 80 }
+            exit 1
+          }
           xmake build -y DAHPadRouter
+          if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Package
         shell: pwsh

@@ -86,6 +86,10 @@ struct Config
     int PlayerInputKeySlot = 0;    // found by the PlayerInput probe (Ctrl+Shift+I)
     int PlayerInputAxisSlot = 0;
     int AimFix = 1;                // 1 = each split-screen player aims at the middle of their own view
+    // Where each player aims, as a fraction of the whole screen, measured from the corner of
+    // that player's own view (the game measures from there). Re-read while the game runs.
+    float AimP1X = 0.25f, AimP2X = 0.25f;   // left/right split
+    float AimP1Y0 = 0.0f, AimP2Y0 = 0.0f;   // top/bottom split: added to the half-height aim point
 };
 static Config g_Cfg;
 
@@ -107,6 +111,7 @@ static void LoadConfig()
         std::string key(line);
         while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) { key.pop_back(); }
         long v = std::strtol(eq + 1, nullptr, 0);  // base 0: accepts 0x..
+        const float fv = float(std::strtod(eq + 1, nullptr));
         if (key == "Enabled") { g_Cfg.Enabled = v != 0; }
         else if (key == "HidePadIndex") { g_Cfg.HidePadIndex = int(v); }
         else if (key == "P2ControllerId") { g_Cfg.P2ControllerId = int(v); }
@@ -118,6 +123,10 @@ static void LoadConfig()
         else if (key == "PlayerInputKeySlot") { g_Cfg.PlayerInputKeySlot = int(v); }
         else if (key == "PlayerInputAxisSlot") { g_Cfg.PlayerInputAxisSlot = int(v); }
         else if (key == "AimFix") { g_Cfg.AimFix = int(v); }
+        else if (key == "AimP1X") { g_Cfg.AimP1X = fv; }
+        else if (key == "AimP2X") { g_Cfg.AimP2X = fv; }
+        else if (key == "AimP1Y0") { g_Cfg.AimP1Y0 = fv; }
+        else if (key == "AimP2Y0") { g_Cfg.AimP2Y0 = fv; }
     }
     std::fclose(f);
     Log("Config: Enabled=%d HidePadIndex=%d Mode=%d (%s) P2ControllerId=%d InputKeySlot=%d InputAxisSlot=%d "
@@ -773,12 +782,12 @@ static FVec2* AimCrosshairHook(uint8_t* tc, FVec2* out)
         const bool second = self == p2;
         if (g_LayoutVertical.load(std::memory_order_relaxed))
         {
-            x = second ? w * 0.75f : w * 0.25f;            // middle of the left / right half
+            x = w * (second ? g_Cfg.AimP2X : g_Cfg.AimP1X);   // middle of the player's own half
         }
         else
         {
-            const float half = (off + 1.0f) * h * 0.25f;   // same point inside a half-height view
-            y = second ? h * 0.5f + half : half;
+            const float half = (off + 1.0f) * h * 0.25f;      // same point inside a half-height view
+            y = h * (second ? g_Cfg.AimP2Y0 : g_Cfg.AimP1Y0) + half;
         }
         g_AimCalls.fetch_add(1, std::memory_order_relaxed);
     }
@@ -1237,6 +1246,28 @@ static DWORD WINAPI Worker(LPVOID)
         {
             EnumWindows(&FindGameWindow, 0);
             if (g_GameThreadId.load()) { Log("Game window found; game thread is %lu", g_GameThreadId.load()); }
+        }
+
+        // Pick up DAHPadRouter.ini edits while the game runs (aim position tweaks).
+        static ULONGLONG lastIniCheck = 0;
+        static FILETIME iniTime{};
+        if (now - lastIniCheck > 2000)
+        {
+            lastIniCheck = now;
+            WIN32_FILE_ATTRIBUTE_DATA attr{};
+            if (GetFileAttributesExW((g_ExeDir + L"\\DAHPadRouter.ini").c_str(), GetFileExInfoStandard, &attr))
+            {
+                if (iniTime.dwLowDateTime || iniTime.dwHighDateTime)
+                {
+                    if (CompareFileTime(&attr.ftLastWriteTime, &iniTime) != 0)
+                    {
+                        LoadConfig();
+                        Log("DAHPadRouter.ini changed: aim P1 x=%.3f P2 x=%.3f (left/right), P1 y0=%.3f P2 y0=%.3f (top/bottom)",
+                            g_Cfg.AimP1X, g_Cfg.AimP2X, g_Cfg.AimP1Y0, g_Cfg.AimP2Y0);
+                    }
+                }
+                iniTime = attr.ftLastWriteTime;
+            }
         }
 
         probe.Update();

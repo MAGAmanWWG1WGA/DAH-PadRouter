@@ -85,6 +85,7 @@ struct Config
     int Mode = 1;                  // 1 = feed Player 2's PlayerInput directly, 0 = go through the viewport
     int PlayerInputKeySlot = 0;    // found by the PlayerInput probe (Ctrl+Shift+I)
     int PlayerInputAxisSlot = 0;
+    int AimFix = 1;                // 1 = each split-screen player aims at the middle of their own view
 };
 static Config g_Cfg;
 
@@ -116,6 +117,7 @@ static void LoadConfig()
         else if (key == "Mode") { g_Cfg.Mode = int(v); }
         else if (key == "PlayerInputKeySlot") { g_Cfg.PlayerInputKeySlot = int(v); }
         else if (key == "PlayerInputAxisSlot") { g_Cfg.PlayerInputAxisSlot = int(v); }
+        else if (key == "AimFix") { g_Cfg.AimFix = int(v); }
     }
     std::fclose(f);
     Log("Config: Enabled=%d HidePadIndex=%d Mode=%d (%s) P2ControllerId=%d InputKeySlot=%d InputAxisSlot=%d "
@@ -721,6 +723,129 @@ extern "C" DWORD WINAPI Proxy_XInputPowerOffController(DWORD userIndex)
 // ============================================================================
 // Handshake from the DAHPadLink Lua mod
 // ============================================================================
+// ============================================================================
+// Split-screen aim fix
+// ----------------------------------------------------------------------------
+// The game asks one function (on BFGActorComponent_TargetSystem) for the screen point
+// that every weapon, lock-on and ability aims at. Stock code returns the middle of the
+// WHOLE screen (raised by m_fCrosshairOffsetY), which in split screen is the line between
+// the two views. We replace that function with a copy that returns the middle of the
+// calling player's own half. Which player owns which target component comes from the
+// DAHPadLink handshake (p1target= / p2target= / layout=). Everything else is unchanged.
+// The function is found by its bytes, so the fix keeps working if the exe moves code.
+// ============================================================================
+struct FVec2 { float X, Y; };
+struct FIntPt { int32_t X, Y; };
+using GetSizeXYFn = FIntPt* (*)(void* viewport, FIntPt* out);
+
+static std::atomic<uintptr_t> g_P1Target{0};
+static std::atomic<uintptr_t> g_P2Target{0};
+static std::atomic<int> g_LayoutVertical{1};   // 1 = left/right, 0 = top/bottom
+static uintptr_t* g_GEnginePtr = nullptr;      // address of the GEngine global
+static int32_t g_OffGameViewport = 0, g_OffViewport = 0, g_OffAltFlag = 0, g_OffAltOffset = 0, g_OffOffset = 0;
+static std::atomic<bool> g_AimFixOn{false};
+static std::atomic<long> g_AimCalls{0};
+
+static FVec2* AimCrosshairHook(uint8_t* tc, FVec2* out)
+{
+    out->X = 0.0f;
+    out->Y = 0.0f;
+    const uintptr_t engine = g_GEnginePtr ? *g_GEnginePtr : 0;
+    if (!engine) { return out; }
+    const uintptr_t gv = *reinterpret_cast<uintptr_t*>(engine + g_OffGameViewport);
+    if (!gv) { return out; }
+    void* vp = *reinterpret_cast<void**>(gv + g_OffViewport);
+    if (!vp) { return out; }
+    auto vtable = *reinterpret_cast<uintptr_t**>(vp);
+    FIntPt size{};
+    const FIntPt* s = reinterpret_cast<GetSizeXYFn>(vtable[3])(vp, &size);
+    const float w = float(s->X), h = float(s->Y);
+    const float off = tc[g_OffAltFlag] ? *reinterpret_cast<float*>(tc + g_OffAltOffset)
+                                       : *reinterpret_cast<float*>(tc + g_OffOffset);
+    float x = w * 0.5f;
+    float y = (off + 1.0f) * h * 0.5f;   // same as the game: offset is a fraction of half the height
+
+    const uintptr_t self = reinterpret_cast<uintptr_t>(tc);
+    const uintptr_t p1 = g_P1Target.load(std::memory_order_relaxed);
+    const uintptr_t p2 = g_P2Target.load(std::memory_order_relaxed);
+    if (p2 && (self == p1 || self == p2))
+    {
+        const bool second = self == p2;
+        if (g_LayoutVertical.load(std::memory_order_relaxed))
+        {
+            x = second ? w * 0.75f : w * 0.25f;            // middle of the left / right half
+        }
+        else
+        {
+            const float half = (off + 1.0f) * h * 0.25f;   // same point inside a half-height view
+            y = second ? h * 0.5f + half : half;
+        }
+        g_AimCalls.fetch_add(1, std::memory_order_relaxed);
+    }
+    out->X = x;
+    out->Y = y;
+    return out;
+}
+
+static void InstallAimFix()
+{
+    // 48 89 5C 24 08 57 48 83 EC 20 48 8B 05 <GEngine> 48 8B DA 48 8B F9 ... (see the comment above)
+    static const char* kPattern =
+        "48 89 5C 24 08 57 48 83 EC 20 48 8B 05 ?? ?? ?? ?? 48 8B DA 48 8B F9 48 85 C0 0F 84 ?? ?? ?? ?? "
+        "48 8B 80 ?? ?? ?? ?? 48 85 C0 74 ?? 48 8B 88 ?? ?? ?? ?? 48 85 C9 74 ?? 48 8B 01 48 8D 54 24 40 "
+        "FF 50 18 48 8B 08 66 0F 6E D1 48 C1 E9 20 80 BF ?? ?? ?? ?? 00 0F 5B D2 66 0F 6E D9 0F 5B DB 74 0A "
+        "F3 0F 10 8F ?? ?? ?? ?? EB 08 F3 0F 10 8F ?? ?? ?? ?? F3 0F 58 0D";
+    std::vector<int> pat;
+    for (const char* p = kPattern; *p;)
+    {
+        if (*p == ' ') { ++p; continue; }
+        if (p[0] == '?') { pat.push_back(-1); p += 2; continue; }
+        pat.push_back(int(std::strtol(std::string(p, 2).c_str(), nullptr, 16)));
+        p += 2;
+    }
+    if (!g_Text.begin) { Log("Aim fix: game code not located"); return; }
+    uintptr_t found = 0;
+    int matches = 0;
+    for (uintptr_t a = g_Text.begin; a + pat.size() < g_Text.end; ++a)
+    {
+        const uint8_t* b = reinterpret_cast<const uint8_t*>(a);
+        if (b[0] != 0x48 || b[1] != 0x89) { continue; }
+        size_t i = 0;
+        for (; i < pat.size(); ++i) { if (pat[i] >= 0 && b[i] != pat[i]) { break; } }
+        if (i == pat.size()) { if (!found) { found = a; } ++matches; }
+    }
+    if (matches != 1)
+    {
+        Log("Aim fix: aim-point function %s (%d matches); split-screen aim stays stock",
+            matches ? "ambiguous" : "not found", matches);
+        return;
+    }
+    auto rd32 = [&](int at) { int32_t v; std::memcpy(&v, reinterpret_cast<void*>(found + at), 4); return v; };
+    g_GEnginePtr = reinterpret_cast<uintptr_t*>(found + 17 + rd32(13));
+    g_OffGameViewport = rd32(35);
+    g_OffViewport = rd32(47);
+    g_OffAltFlag = rd32(80);
+    g_OffAltOffset = rd32(101);
+    g_OffOffset = rd32(111);
+
+    // Jump from the start of the game's function to ours:  jmp qword ptr [rip+0] ; <address>
+    uint8_t patch[14] = {0xFF, 0x25, 0, 0, 0, 0};
+    const uintptr_t target = reinterpret_cast<uintptr_t>(&AimCrosshairHook);
+    std::memcpy(patch + 6, &target, 8);
+    DWORD old = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(found), sizeof(patch), PAGE_EXECUTE_READWRITE, &old))
+    {
+        Log("Aim fix: could not unprotect the game code");
+        return;
+    }
+    std::memcpy(reinterpret_cast<void*>(found), patch, sizeof(patch));
+    VirtualProtect(reinterpret_cast<void*>(found), sizeof(patch), old, &old);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(found), sizeof(patch));
+    g_AimFixOn = true;
+    Log("Aim fix: installed at %p (GEngine %p, offsets %X/%X/%X/%X/%X)", (void*)found, (void*)g_GEnginePtr,
+        g_OffGameViewport, g_OffViewport, g_OffAltFlag, g_OffAltOffset, g_OffOffset);
+}
+
 static FILETIME g_HandshakeTime{};
 static uintptr_t g_HandshakeViewport = 0;
 
@@ -761,6 +886,8 @@ static void ApplyHandshake()
 
     uintptr_t viewport = 0;
     uintptr_t p1input = 0, p2input = 0;
+    uintptr_t p1target = 0, p2target = 0;
+    int layoutVertical = 1;
     int found = 0;
     for (const auto& line : lines)
     {
@@ -776,6 +903,18 @@ static void ApplyHandshake()
         {
             p2input = static_cast<uintptr_t>(std::strtoull(line.c_str() + 8, nullptr, 0));
         }
+        else if (line.rfind("p1target=", 0) == 0)
+        {
+            p1target = static_cast<uintptr_t>(std::strtoull(line.c_str() + 9, nullptr, 0));
+        }
+        else if (line.rfind("p2target=", 0) == 0)
+        {
+            p2target = static_cast<uintptr_t>(std::strtoull(line.c_str() + 9, nullptr, 0));
+        }
+        else if (line.rfind("layout=", 0) == 0)
+        {
+            layoutVertical = line.compare(7, 8, "vertical") == 0 ? 1 : 0;
+        }
         else if (line.rfind("key ", 0) == 0)
         {
             auto eq = line.find('=');
@@ -788,6 +927,16 @@ static void ApplyHandshake()
         }
     }
     Log("Handshake read: viewport=%p, %d of %d key names", (void*)viewport, found, int(BK_Count + AK_Count));
+    if (p1target != g_P1Target.load() || p2target != g_P2Target.load() || layoutVertical != g_LayoutVertical.load())
+    {
+        g_P1Target = p1target;
+        g_P2Target = p2target;
+        g_LayoutVertical = layoutVertical;
+        Log("Aim fix: P1 target %p, P2 target %p, layout %s%s", (void*)p1target, (void*)p2target,
+            layoutVertical ? "left/right" : "top/bottom",
+            g_AimFixOn.load() ? (p2target ? " -> each player aims at the middle of their own view" : " (one player: stock aim)")
+                              : " (fix not installed)");
+    }
     if (found == BK_Count + AK_Count) { g_NamesReady = true; }
     else { Log("WARNING: some key names missing from the handshake; routing stays off"); }
 
@@ -1060,6 +1209,9 @@ static DWORD WINAPI Worker(LPVOID)
     g_Enabled = g_Cfg.Enabled;
     Log("Ctrl+Shift+I = probe PlayerInput slots | Ctrl+Shift+P = probe viewport slots | Ctrl+Shift+O = toggle on/off. "
         "Hiding pad %d from the game.", g_Cfg.HidePadIndex);
+
+    if (g_Cfg.AimFix) { InstallAimFix(); }
+    else { Log("Aim fix: off (AimFix=0 in DAHPadRouter.ini)"); }
 
     Probe probe;
     bool probeWas = false, toggleWas = false, probeInputWas = false;

@@ -1,0 +1,51 @@
+name: Build xinput proxy (standalone DAHPadRouter)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "proxy/**"
+      - "DAHPadLink/**"
+      - ".github/workflows/build-proxy.yml"
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - name: Check out this repo
+        uses: actions/checkout@v4
+
+      - name: Set up the Visual Studio compiler
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Compile
+        shell: cmd
+        run: |
+          mkdir build
+          cl /nologo /O2 /EHsc /std:c++17 /MT /W3 /LD proxy\proxy.cpp /Fobuild\ /Fe:build\xinput1_3.dll /link /DEF:proxy\xinput.def user32.lib
+          if errorlevel 1 exit /b 1
+
+      - name: Check the exports
+        shell: cmd
+        run: dumpbin /exports build\xinput1_3.dll
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $w = "out/Win64"
+          New-Item -ItemType Directory -Force "$w/ue4ss/Mods/DAHPadLink/Scripts" | Out-Null
+          Copy-Item build/xinput1_3.dll "$w/xinput1_3.dll"
+          Copy-Item build/xinput1_3.dll "$w/xinput1_4.dll"
+          Copy-Item build/xinput1_3.dll "$w/xinput9_1_0.dll"
+          Copy-Item proxy/DAHPadRouter.ini "$w/DAHPadRouter.ini"
+          Copy-Item DAHPadLink/Scripts/main.lua "$w/ue4ss/Mods/DAHPadLink/Scripts/main.lua"
+          Get-ChildItem -Recurse out | ForEach-Object { $_.FullName }
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: DAHPadRouter-standalone
+          path: out/

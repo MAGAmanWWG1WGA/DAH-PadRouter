@@ -480,6 +480,64 @@ static bool AnyHeld()
 }
 
 // ============================================================================
+// Who is calling, and pad diagnostics
+// ============================================================================
+static std::atomic<DWORD> g_GameThreadId{0};  // thread that owns the game window (UE's game thread)
+static ULONGLONG g_MonitorUntil = 0;          // log pad activity until this tick count
+static std::atomic<int> g_MonitorLines{0};
+
+static std::string ModuleNameOf(void* address)
+{
+    HMODULE mod{};
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCWSTR>(address), &mod))
+    {
+        return "?";
+    }
+    char path[MAX_PATH]{};
+    GetModuleFileNameA(mod, path, MAX_PATH);
+    const char* name = std::strrchr(path, '\\');
+    return name ? name + 1 : path;
+}
+
+static bool CalledByGame(void* returnAddress)
+{
+    const DWORD gameThread = g_GameThreadId.load();
+    if (gameThread && GetCurrentThreadId() == gameThread) { return true; }
+    return g_Text.contains(reinterpret_cast<uintptr_t>(returnAddress));
+}
+
+// Logs, per XInput slot: first time it is read (and by whom), connect/disconnect, and
+// button changes during the monitor window. Called on every XInputGetState.
+static void MonitorPad(DWORD userIndex, DWORD result, const XINPUT_STATE* state, void* returnAddress)
+{
+    if (userIndex > 3) { return; }
+    static std::atomic<int> lastResult[4] = {-1, -1, -1, -1};
+    static WORD lastButtons[4]{};
+    static bool loggedCaller[4]{};
+
+    if (!loggedCaller[userIndex])
+    {
+        loggedCaller[userIndex] = true;
+        Log("Slot %lu first read by %s (thread %lu, game thread %lu)", userIndex,
+            ModuleNameOf(returnAddress).c_str(), GetCurrentThreadId(), g_GameThreadId.load());
+    }
+    if (lastResult[userIndex].exchange(int(result)) != int(result))
+    {
+        Log("Slot %lu: %s", userIndex, result == ERROR_SUCCESS ? "pad CONNECTED" : "no pad");
+    }
+    if (result == ERROR_SUCCESS && state && GetTickCount64() < g_MonitorUntil)
+    {
+        const WORD b = state->Gamepad.wButtons;
+        if (b != lastButtons[userIndex] && g_MonitorLines.fetch_add(1) < 300)
+        {
+            Log("Slot %lu buttons: 0x%04X%s", userIndex, b, b & XINPUT_GAMEPAD_A ? "  (A held)" : "");
+        }
+        lastButtons[userIndex] = b;
+    }
+}
+
+// ============================================================================
 // Exported XInput functions
 // ============================================================================
 extern "C" DWORD WINAPI Proxy_XInputGetState(DWORD userIndex, XINPUT_STATE* state)
@@ -487,11 +545,13 @@ extern "C" DWORD WINAPI Proxy_XInputGetState(DWORD userIndex, XINPUT_STATE* stat
     LoadRealXInput();
     if (!g_Real.GetState) { return ERROR_DEVICE_NOT_CONNECTED; }
     DWORD result = g_Real.GetState(userIndex, state);
+    void* const caller = _ReturnAddress();
+    MonitorPad(userIndex, result, state, caller);
     if (int(userIndex) != g_Cfg.HidePadIndex) { return result; }
 
     if (!g_Enabled)
     {
-        if (g_Text.contains(reinterpret_cast<uintptr_t>(_ReturnAddress())) && AnyHeld() && InjectionReady())
+        if (CalledByGame(caller) && AnyHeld() && InjectionReady())
         {
             RoutePad(nullptr);  // release anything still held
         }
@@ -500,7 +560,7 @@ extern "C" DWORD WINAPI Proxy_XInputGetState(DWORD userIndex, XINPUT_STATE* stat
 
     // Only the game's own polling (game thread) may drive Player 2. Other callers, like an
     // overlay, still see the pad as idle but never inject input.
-    const bool fromGame = g_Text.contains(reinterpret_cast<uintptr_t>(_ReturnAddress()));
+    const bool fromGame = CalledByGame(caller);
 
     const bool connected = result == ERROR_SUCCESS && state;
     XINPUT_GAMEPAD pad{};
@@ -813,8 +873,12 @@ public:
         }
         for (int i = 1; i < m_slots; ++i)
         {
-            LONG64 axisScore = m_counts[i][2] - m_counts[i][0];
-            if (i != bestKey && axisScore > bestAxisScore) { bestAxisScore = axisScore; bestAxis = i; }
+            const auto& c = m_counts[i];
+            // InputAxis stays silent while only A is tapped. Slots that also fire on button
+            // presses are helpers that both InputKey and InputAxis call; skip those.
+            if (i == bestKey || c[1] - c[0] > 0) { continue; }
+            LONG64 axisScore = c[2] - c[0];
+            if (axisScore > bestAxisScore) { bestAxisScore = axisScore; bestAxis = i; }
         }
         if (bestKey && bestAxis)
         {
@@ -840,8 +904,22 @@ static bool GameHasFocus()
 }
 static bool Down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
 
+static BOOL CALLBACK FindGameWindow(HWND hwnd, LPARAM)
+{
+    DWORD pid{};
+    const DWORD thread = GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != GetCurrentProcessId()) { return TRUE; }
+    char cls[64]{};
+    GetClassNameA(hwnd, cls, sizeof(cls));
+    if (std::strcmp(cls, "UnrealWindow") != 0) { return TRUE; }
+    g_GameThreadId = thread;
+    return FALSE;
+}
+
 static DWORD WINAPI Worker(LPVOID)
 {
+    g_MonitorUntil = GetTickCount64() + 180000;
+    Log("Pad monitor ON for 3 minutes: press A on each pad to see which slot it is.");
     g_Enabled = g_Cfg.Enabled;
     Log("Ctrl+Shift+P = probe slots | Ctrl+Shift+O = toggle on/off. Hiding pad %d from the game.", g_Cfg.HidePadIndex);
 
@@ -863,6 +941,12 @@ static DWORD WINAPI Worker(LPVOID)
                 warnedNoHandshake = true;
                 Log("No handshake after 2 minutes: is the DAHPadLink Lua mod enabled in mods.txt?");
             }
+        }
+
+        if (!g_GameThreadId.load())
+        {
+            EnumWindows(&FindGameWindow, 0);
+            if (g_GameThreadId.load()) { Log("Game window found; game thread is %lu", g_GameThreadId.load()); }
         }
 
         probe.Update();

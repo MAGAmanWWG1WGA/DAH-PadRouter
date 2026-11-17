@@ -47,6 +47,13 @@ jobs:
           # Some packages are listed as git@github.com:... ; the build machine has no SSH key, so use https.
           git config --global url."https://github.com/".insteadOf "git@github.com:"
 
+      - name: Put the mod inside UE4SS's project (UE4SS must be the main project)
+        shell: pwsh
+        run: |
+          Copy-Item -Recurse DAHPadRouter RE-UE4SS/DAHPadRouter
+          Add-Content RE-UE4SS/xmake.lua "`nincludes(`"DAHPadRouter`")"
+          Get-Content RE-UE4SS/xmake.lua -Tail 5
+
       - name: Install xmake
         uses: xmake-io/github-action-setup-xmake@v1
         with:
@@ -60,6 +67,7 @@ jobs:
 
       - name: Set up packages (retries up to 3 times)
         shell: pwsh
+        working-directory: RE-UE4SS
         run: |
           $ok = $false
           for ($i = 1; $i -le 3; $i++) {
@@ -78,6 +86,7 @@ jobs:
 
       - name: Compile UE4SS and the mod (slow, 1-3 hours the first time)
         shell: pwsh
+        working-directory: RE-UE4SS
         run: |
           xmake build -y DAHPadRouter
           if ($LASTEXITCODE -ne 0) { exit 1 }

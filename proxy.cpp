@@ -82,6 +82,9 @@ struct Config
     int InputAxisSlot = 0;         // found by the probe
     int ViewportClientOffset = 0;  // 0 = auto-detect the FViewportClient part of the viewport object
     int ViewportPtrOffset = 0x98;  // UGameViewportClient::Viewport (from UE4SS.log member offsets)
+    int Mode = 1;                  // 1 = feed Player 2's PlayerInput directly, 0 = go through the viewport
+    int PlayerInputKeySlot = 0;    // found by the PlayerInput probe (Ctrl+Shift+I)
+    int PlayerInputAxisSlot = 0;
 };
 static Config g_Cfg;
 
@@ -110,10 +113,15 @@ static void LoadConfig()
         else if (key == "InputAxisSlot") { g_Cfg.InputAxisSlot = int(v); }
         else if (key == "ViewportClientOffset") { g_Cfg.ViewportClientOffset = int(v); }
         else if (key == "ViewportPtrOffset") { g_Cfg.ViewportPtrOffset = int(v); }
+        else if (key == "Mode") { g_Cfg.Mode = int(v); }
+        else if (key == "PlayerInputKeySlot") { g_Cfg.PlayerInputKeySlot = int(v); }
+        else if (key == "PlayerInputAxisSlot") { g_Cfg.PlayerInputAxisSlot = int(v); }
     }
     std::fclose(f);
-    Log("Config: Enabled=%d HidePadIndex=%d P2ControllerId=%d InputKeySlot=%d InputAxisSlot=%d",
-        g_Cfg.Enabled, g_Cfg.HidePadIndex, g_Cfg.P2ControllerId, g_Cfg.InputKeySlot, g_Cfg.InputAxisSlot);
+    Log("Config: Enabled=%d HidePadIndex=%d Mode=%d (%s) P2ControllerId=%d InputKeySlot=%d InputAxisSlot=%d "
+        "PlayerInputKeySlot=%d PlayerInputAxisSlot=%d",
+        g_Cfg.Enabled, g_Cfg.HidePadIndex, g_Cfg.Mode, g_Cfg.Mode == 1 ? "PlayerInput" : "viewport", g_Cfg.P2ControllerId,
+        g_Cfg.InputKeySlot, g_Cfg.InputAxisSlot, g_Cfg.PlayerInputKeySlot, g_Cfg.PlayerInputAxisSlot);
 }
 
 // ============================================================================
@@ -317,6 +325,17 @@ using InputKeyFn = bool (*)(void* self, FInputKeyEventArgsRaw* args);
 using InputAxisFn = bool (*)(void* self, void* viewport, int32_t controllerId, FKeyRaw* key,
                              float delta, float deltaTime, int32_t numSamples, bool bGamepad);
 
+// UPlayerInput::InputKey(FKey Key, EInputEvent Event, float AmountDepressed, bool bGamepad)
+// UPlayerInput::InputAxis(FKey Key, float Delta, float DeltaTime, int32 NumSamples, bool bGamepad)
+using PIKeyFn = bool (*)(void* self, FKeyRaw* key, int32_t event, float amountDepressed, bool bGamepad);
+using PIAxisFn = bool (*)(void* self, FKeyRaw* key, float delta, float deltaTime, int32_t numSamples, bool bGamepad);
+static std::atomic<uintptr_t> g_P1Input{0};   // Player 1's PlayerInput (used by the probe)
+static std::atomic<uintptr_t> g_P2Input{0};   // Player 2's PlayerInput (where pad 2 goes)
+static std::atomic<uintptr_t> g_InputVTable{0};
+static std::atomic<PIKeyFn> g_PIKey{nullptr};
+static std::atomic<PIAxisFn> g_PIAxis{nullptr};
+static std::atomic<bool> g_ResetPad{false};   // Player 2 changed: forget held buttons without sending
+
 static std::atomic<uintptr_t> g_ViewportObj{0};
 static std::atomic<uintptr_t> g_ViewportPart{0};
 static std::atomic<InputKeyFn> g_InputKey{nullptr};
@@ -403,8 +422,25 @@ static std::array<float, AK_Count> g_PrevAxes{};
 static LARGE_INTEGER g_LastInjectTime{};
 static bool g_LoggedFirstInject = false;
 
+static bool PlayerInputValid(uintptr_t input)
+{
+    uintptr_t vt{};
+    return input && SafeReadPtr(input, vt) && vt == g_InputVTable.load();
+}
+
 static void SendKey(int index, bool pressed)
 {
+    if (g_Cfg.Mode == 1)
+    {
+        auto fn = g_PIKey.load();
+        const uintptr_t input = g_P2Input.load();
+        if (!fn || !PlayerInputValid(input)) { return; }
+        FKeyRaw key{};  // fresh every call: passed by value, the engine destroys its copy
+        key.Name = g_ButtonFNames[index];
+        fn(reinterpret_cast<void*>(input), &key, pressed ? 0 : 1, 1.0f, true);
+        return;
+    }
+
     auto fn = g_InputKey.load();
     auto self = reinterpret_cast<void*>(g_ViewportPart.load());
     uintptr_t viewport{};
@@ -421,6 +457,17 @@ static void SendKey(int index, bool pressed)
 
 static void SendAxis(int index, float value, float dt)
 {
+    if (g_Cfg.Mode == 1)
+    {
+        auto fn = g_PIAxis.load();
+        const uintptr_t input = g_P2Input.load();
+        if (!fn || !PlayerInputValid(input)) { return; }
+        FKeyRaw key{};
+        key.Name = g_AxisFNames[index];
+        fn(reinterpret_cast<void*>(input), &key, value, dt, 1, true);
+        return;
+    }
+
     auto fn = g_InputAxis.load();
     auto self = reinterpret_cast<void*>(g_ViewportPart.load());
     uintptr_t viewport{};
@@ -433,12 +480,19 @@ static void SendAxis(int index, float value, float dt)
 
 static bool InjectionReady()
 {
-    return g_NamesReady && g_InputKey.load() && g_InputAxis.load() && g_ViewportPart.load() && !g_Probing;
+    if (g_Probing || !g_NamesReady) { return false; }
+    if (g_Cfg.Mode == 1) { return g_PIKey.load() && g_PIAxis.load() && g_P2Input.load(); }
+    return g_InputKey.load() && g_InputAxis.load() && g_ViewportPart.load();
 }
 
 // Called on the game thread every time the game polls Player 2's pad.
 static void RoutePad(const XINPUT_GAMEPAD* pad)
 {
+    if (g_ResetPad.exchange(false))
+    {
+        g_PrevButtons = {};
+        g_PrevAxes = {};
+    }
     std::array<bool, BK_Count> buttons{};
     std::array<float, AK_Count> axes{};
     if (pad)
@@ -690,12 +744,21 @@ static void ApplyHandshake()
     if (!ReadHandshake(lines)) { return; }
 
     uintptr_t viewport = 0;
+    uintptr_t p1input = 0, p2input = 0;
     int found = 0;
     for (const auto& line : lines)
     {
         if (line.rfind("viewport=", 0) == 0)
         {
             viewport = static_cast<uintptr_t>(std::strtoull(line.c_str() + 9, nullptr, 0));
+        }
+        else if (line.rfind("p1input=", 0) == 0)
+        {
+            p1input = static_cast<uintptr_t>(std::strtoull(line.c_str() + 8, nullptr, 0));
+        }
+        else if (line.rfind("p2input=", 0) == 0)
+        {
+            p2input = static_cast<uintptr_t>(std::strtoull(line.c_str() + 8, nullptr, 0));
         }
         else if (line.rfind("key ", 0) == 0)
         {
@@ -711,6 +774,48 @@ static void ApplyHandshake()
     Log("Handshake read: viewport=%p, %d of %d key names", (void*)viewport, found, int(BK_Count + AK_Count));
     if (found == BK_Count + AK_Count) { g_NamesReady = true; }
     else { Log("WARNING: some key names missing from the handshake; routing stays off"); }
+
+    // Player 1's / Player 2's PlayerInput objects (both use the same class, so one vtable).
+    if (p1input != g_P1Input.load() || p2input != g_P2Input.load())
+    {
+        uintptr_t vt{};
+        const uintptr_t any = p1input ? p1input : p2input;
+        if (any && SafeReadPtr(any, vt) && LooksLikeVTable(vt))
+        {
+            g_InputVTable = vt;
+            const int slots = CountVTableEntries(vt);
+            PIKeyFn keyFn = nullptr;
+            PIAxisFn axisFn = nullptr;
+            if (g_Cfg.PlayerInputKeySlot > 0 && g_Cfg.PlayerInputAxisSlot > 0 &&
+                g_Cfg.PlayerInputKeySlot < slots && g_Cfg.PlayerInputAxisSlot < slots)
+            {
+                uintptr_t k{}, a{};
+                SafeReadPtr(vt + g_Cfg.PlayerInputKeySlot * sizeof(void*), k);
+                SafeReadPtr(vt + g_Cfg.PlayerInputAxisSlot * sizeof(void*), a);
+                keyFn = reinterpret_cast<PIKeyFn>(k);
+                axisFn = reinterpret_cast<PIAxisFn>(a);
+            }
+            g_PIKey = keyFn;
+            g_PIAxis = axisFn;
+            uintptr_t vt2{};
+            const bool sameClass = !p1input || !p2input || (SafeReadPtr(p2input, vt2) && vt2 == vt);
+            Log("PlayerInput: P1 %p, P2 %p, %d vtable slots%s", (void*)p1input, (void*)p2input, slots,
+                sameClass ? "" : "  WARNING: P1 and P2 use different PlayerInput classes");
+            if (g_Cfg.Mode == 1)
+            {
+                if (keyFn && p2input) { Log("Routing ready (PlayerInput): key slot %d, axis slot %d", g_Cfg.PlayerInputKeySlot, g_Cfg.PlayerInputAxisSlot); }
+                else if (!keyFn) { Log("PlayerInput slots not set. Load a save and press Ctrl+Shift+I to probe them."); }
+                else { Log("Player 2 not spawned yet (press Ctrl+Y)"); }
+            }
+        }
+        else if (any)
+        {
+            Log("WARNING: PlayerInput address from the handshake doesn't look like a game object");
+        }
+        g_P1Input = p1input;
+        if (p2input != g_P2Input.load()) { g_ResetPad = true; }
+        g_P2Input = p2input;
+    }
 
     if (viewport && viewport != g_HandshakeViewport)
     {
@@ -747,8 +852,11 @@ static void ApplyHandshake()
         g_ViewportPart = part;
         g_InputKey = keyFn;
         g_InputAxis = axisFn;
-        if (keyFn) { Log("Routing ready: InputKey slot %d, InputAxis slot %d", g_Cfg.InputKeySlot, g_Cfg.InputAxisSlot); }
-        else { Log("Slots not set: pad %d is hidden but not routed. Press Ctrl+Shift+P in-game to probe.", g_Cfg.HidePadIndex); }
+        if (g_Cfg.Mode == 0)
+        {
+            if (keyFn) { Log("Routing ready (viewport): InputKey slot %d, InputAxis slot %d", g_Cfg.InputKeySlot, g_Cfg.InputAxisSlot); }
+            else { Log("Viewport slots not set: pad %d is hidden but not routed. Press Ctrl+Shift+P in-game to probe.", g_Cfg.HidePadIndex); }
+        }
     }
 }
 
@@ -785,10 +893,16 @@ class Probe
 public:
     bool Running() const { return m_phase != Phase::Idle; }
 
-    void Start(uintptr_t viewportPart)
+    const char* m_keyName = "InputKeySlot";
+    const char* m_axisName = "InputAxisSlot";
+
+    // objectWithVTable: any object whose vtable to probe. Names: the ini keys to suggest.
+    void Start(uintptr_t objectWithVTable, const char* keyName, const char* axisName)
     {
+        m_keyName = keyName;
+        m_axisName = axisName;
         uintptr_t vt{};
-        if (!SafeReadPtr(viewportPart, vt)) { return; }
+        if (!SafeReadPtr(objectWithVTable, vt)) { return; }
         m_vtable = vt;
         m_slots = CountVTableEntries(vt);
         if (m_slots < 8)
@@ -882,7 +996,7 @@ public:
         }
         if (bestKey && bestAxis)
         {
-            Log("PROBE suggestion: InputKeySlot=%d  InputAxisSlot=%d", bestKey, bestAxis);
+            Log("PROBE suggestion: %s=%d  %s=%d", m_keyName, bestKey, m_axisName, bestAxis);
             Log("Put those in DAHPadRouter.ini and restart the game. Send this log if unsure.");
             Beep(1);
         }
@@ -921,10 +1035,11 @@ static DWORD WINAPI Worker(LPVOID)
     g_MonitorUntil = GetTickCount64() + 180000;
     Log("Pad monitor ON for 3 minutes: press A on each pad to see which slot it is.");
     g_Enabled = g_Cfg.Enabled;
-    Log("Ctrl+Shift+P = probe slots | Ctrl+Shift+O = toggle on/off. Hiding pad %d from the game.", g_Cfg.HidePadIndex);
+    Log("Ctrl+Shift+I = probe PlayerInput slots | Ctrl+Shift+P = probe viewport slots | Ctrl+Shift+O = toggle on/off. "
+        "Hiding pad %d from the game.", g_Cfg.HidePadIndex);
 
     Probe probe;
-    bool probeWas = false, toggleWas = false;
+    bool probeWas = false, toggleWas = false, probeInputWas = false;
     ULONGLONG lastHandshake = 0;
     bool warnedNoHandshake = false;
     const ULONGLONG started = GetTickCount64();
@@ -953,13 +1068,21 @@ static DWORD WINAPI Worker(LPVOID)
 
         const bool chord = GameHasFocus() && Down(VK_CONTROL) && Down(VK_SHIFT);
         const bool probeKey = chord && Down('P');
+        const bool probeInputKey = chord && Down('I');
         const bool toggleKey = chord && Down('O');
         if (probeKey && !probeWas)
         {
             if (probe.Running()) { Log("Probe already running"); }
             else if (!g_ViewportPart.load()) { Log("Probe: no viewport yet (handshake missing?)"); }
-            else { probe.Start(g_ViewportPart.load()); }
+            else { Log("Probing the VIEWPORT"); probe.Start(g_ViewportPart.load(), "InputKeySlot", "InputAxisSlot"); }
         }
+        if (probeInputKey && !probeInputWas)
+        {
+            if (probe.Running()) { Log("Probe already running"); }
+            else if (!g_P1Input.load()) { Log("Probe: Player 1's PlayerInput not known yet (load a save first)"); }
+            else { Log("Probing Player 1's PLAYERINPUT"); probe.Start(g_P1Input.load(), "PlayerInputKeySlot", "PlayerInputAxisSlot"); }
+        }
+        probeInputWas = probeInputKey;
         if (toggleKey && !toggleWas)
         {
             g_Enabled = !g_Enabled;

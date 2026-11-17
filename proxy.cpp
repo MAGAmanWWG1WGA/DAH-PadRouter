@@ -93,6 +93,8 @@ struct Config
     float AimP1Y0 = 0.0f, AimP2Y0 = 0.0f;   // top/bottom split: added to the half-height aim point
     int CallSiteLog = 1;
     int OwnerChain = 1;            // 1 = also follow owner/instigator/outer links to decide whose work it is           // 1 = log where the game still asks for "the player" (for fixing)
+    int StaticsContext = 1;        // 1 = Blueprint "Get Player Controller/Pawn/Character (0)" asked by
+                                   //     Player 2's things (effects, abilities) gets Player 2
     int PlayerContext = 1;         // 1 = the game's code asking for "the player" while working on
                                    //     Player 2's things gets Player 2 (lock-on, aiming, pickups)
 };
@@ -132,6 +134,7 @@ static void LoadConfig()
         else if (key == "PlayerContext") { g_Cfg.PlayerContext = int(v); }
         else if (key == "CallSiteLog") { g_Cfg.CallSiteLog = int(v); }
         else if (key == "OwnerChain") { g_Cfg.OwnerChain = int(v); }
+        else if (key == "StaticsContext") { g_Cfg.StaticsContext = int(v); }
         else if (key == "AimP2X") { g_Cfg.AimP2X = fv; }
         else if (key == "AimP1Y0") { g_Cfg.AimP1Y0 = fv; }
         else if (key == "AimP2Y0") { g_Cfg.AimP2Y0 = fv; }
@@ -934,7 +937,7 @@ static void DumpSites()
     {
         if (++shown > 60) { break; }
         Log("  site exe+0x%llX (%s): for P2 %u | for P1 %u | unknown %u", (unsigned long long)(r.ret - base),
-            r.kind == 2 ? "HUD" : "world", r.c[kCtxP2], r.c[kCtxP1], r.c[kCtxUnknown]);
+            r.kind == 2 ? "HUD" : (r.kind == 3 ? "blueprint" : "world"), r.c[kCtxP2], r.c[kCtxP1], r.c[kCtxUnknown]);
     }
 }
 
@@ -1021,6 +1024,33 @@ static void* FirstLocalPCHook(void* gameInstance, const uintptr_t* regs, uintptr
         if (outcome == kCtxP2) { g_CtxP2Hits.fetch_add(1, std::memory_order_relaxed); return reinterpret_cast<void*>(s->p2pc); }
     }
     return g_FirstLocalPCOrig(gameInstance);
+}
+
+// UGameplayStatics::GetPlayerController(WorldContextObject, PlayerIndex): what Blueprints'
+// "Get Player Controller / Pawn / Character (0)" use (GetPlayerPawn and GetPlayerCharacter
+// call it too). Effects and abilities spawned for Player 2 ask it with index 0 and got
+// Player 1 (boost / Destruct-O-Matic effects on Player 1). When the asking object belongs to
+// Player 2, the answer for index 0 is Player 2.
+using StaticsPCFn = void* (*)(void* ctx, int index);
+static StaticsPCFn g_StaticsPCOrig = nullptr;
+static void* StaticsPCHook(void* ctx, int index)
+{
+    if (index == 0 && g_Cfg.StaticsContext && g_Cfg.PlayerContext)
+    {
+        const PlayerSets* s = g_Sets.load(std::memory_order_acquire);
+        if (s && s->p2pc)
+        {
+#ifdef _MSC_VER
+            const uintptr_t ret = reinterpret_cast<uintptr_t>(_ReturnAddress());
+#else
+            const uintptr_t ret = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+#endif
+            const int outcome = ResolveOwner(s, reinterpret_cast<uintptr_t>(ctx), 3);
+            CountSite(ret, outcome, 3);
+            if (outcome == kCtxP2) { g_CtxP2Hits.fetch_add(1, std::memory_order_relaxed); return reinterpret_cast<void*>(s->p2pc); }
+        }
+    }
+    return g_StaticsPCOrig(ctx, index);
 }
 
 static bool IsP2Controller(const void* pc)
@@ -1253,6 +1283,27 @@ static void InstallPlayerContext(uintptr_t aimFn)
             FlushInstructionCache(GetCurrentProcess(), mem, 4096);
             Log("Player context: HUD first-local-player %p %s", (void*)flpc,
                 JumpTo(flpc, reinterpret_cast<uintptr_t>(st)) ? "hooked" : "FAILED");
+        }
+    }
+    // UGameplayStatics::GetPlayerController (Blueprint "Get Player Controller/Pawn/Character").
+    {
+        const uintptr_t gpc = FindUnique(
+            "48 89 5C 24 08 57 48 83 EC 30 8B FA 41 B8 01 00 00 00 48 8B D1 48 8B 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? "
+            "48 85 C0 74 ?? 33 DB 48 8D 54 24 20 48 8B C8", "GameplayStatics::GetPlayerController");
+        auto mem = gpc ? static_cast<uint8_t*>(VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)) : nullptr;
+        if (mem)
+        {
+            // trampoline: the first 18 bytes (mov [rsp+8],rbx / push rdi / sub rsp,30h /
+            // mov edi,edx / mov r8d,1 - nothing address-relative), then back into the original
+            std::memcpy(mem, reinterpret_cast<void*>(gpc), 18);
+            uint8_t jmp[14] = {0xFF, 0x25, 0, 0, 0, 0};
+            const uintptr_t back = gpc + 18;
+            std::memcpy(jmp + 6, &back, 8);
+            std::memcpy(mem + 18, jmp, 14);
+            FlushInstructionCache(GetCurrentProcess(), mem, 64);
+            g_StaticsPCOrig = reinterpret_cast<StaticsPCFn>(mem);
+            Log("Player context: Blueprint get-player %p %s", (void*)gpc,
+                JumpTo(gpc, reinterpret_cast<uintptr_t>(&StaticsPCHook)) ? "hooked" : "FAILED");
         }
     }
     Log("Player context: %s (first-player %p, project %p, deproject %p, game code %p-%p)",

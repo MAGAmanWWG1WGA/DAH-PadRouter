@@ -964,6 +964,24 @@ static bool DeprojectHook(const void* pc, float x, float y, FVec3* loc, FVec3* d
     return reinterpret_cast<DeprojectInnerFn>(g_DeprojectInner)(pc, &sp, loc, dir);
 }
 
+// BFGActorComponent_TargetSystem's own "my player controller" helper. Its owner isn't in a
+// register any more when it asks the world, so it is answered here from 'this' directly.
+static uintptr_t g_TcGetWorldSlow = 0;
+static int32_t g_OffCompWorld = 0;
+using GetWorldFn = void* (*)(void* component);
+static void* TargetSystemPCHook(uint8_t* tc)
+{
+    const PlayerSets* s = g_Sets.load(std::memory_order_acquire);
+    if (s && s->p2pc && g_Cfg.PlayerContext && InSet(s->p2, reinterpret_cast<uintptr_t>(tc)))
+    {
+        g_CtxP2Hits.fetch_add(1, std::memory_order_relaxed);
+        return reinterpret_cast<void*>(s->p2pc);
+    }
+    void* world = *reinterpret_cast<void**>(tc + g_OffCompWorld);
+    if (!world) { world = reinterpret_cast<GetWorldFn>(g_TcGetWorldSlow)(tc); }
+    return OriginalFirstPC(static_cast<uint8_t*>(world));
+}
+
 static std::vector<int> ParsePattern(const char* text)
 {
     std::vector<int> pat;
@@ -1067,6 +1085,36 @@ static void InstallPlayerContext(uintptr_t aimFn)
     const bool ok = JumpTo(gfpc, reinterpret_cast<uintptr_t>(stub)) &&
                     JumpTo(project, reinterpret_cast<uintptr_t>(&ProjectHook)) &&
                     JumpTo(deproject, reinterpret_cast<uintptr_t>(&DeprojectHook));
+    // The TargetSystem helper: same bytes as the game's, and its 2nd call must go to the
+    // first-player function found above.
+    {
+        const std::vector<int> pat = ParsePattern(
+            "40 53 48 83 EC 20 48 8B 81 ?? ?? ?? ?? 48 85 C0 75 05 E8 ?? ?? ?? ?? 48 8B C8 E8 ?? ?? ?? ??");
+        uintptr_t helper = 0;
+        int count = 0;
+        for (uintptr_t a = g_Text.begin; a + pat.size() < g_Text.end; ++a)
+        {
+            const uint8_t* b = reinterpret_cast<const uint8_t*>(a);
+            if (b[0] != 0x40 || b[1] != 0x53) { continue; }
+            size_t i = 2;
+            for (; i < pat.size(); ++i) { if (pat[i] >= 0 && b[i] != pat[i]) { break; } }
+            if (i != pat.size()) { continue; }
+            if (Rel32Target(a + 0x1a) != gfpc) { continue; }
+            helper = a;
+            ++count;
+        }
+        if (count == 1)
+        {
+            std::memcpy(&g_OffCompWorld, reinterpret_cast<void*>(helper + 9), 4);
+            g_TcGetWorldSlow = Rel32Target(helper + 0x12);
+            Log("Player context: TargetSystem helper %p %s", (void*)helper,
+                JumpTo(helper, reinterpret_cast<uintptr_t>(&TargetSystemPCHook)) ? "hooked" : "FAILED");
+        }
+        else
+        {
+            Log("Player context: TargetSystem helper not found (%d matches)", count);
+        }
+    }
     Log("Player context: %s (first-player %p, project %p, deproject %p, game code %p-%p)",
         ok ? "installed" : "FAILED", (void*)gfpc, (void*)project, (void*)deproject, (void*)g_BfgBegin, (void*)g_BfgEnd);
 }
@@ -1171,6 +1219,8 @@ static void ApplyHandshake()
         auto sets = new PlayerSets();
         sets->p1 = p1objs;
         sets->p2 = p2objs;
+        if (p1target) { sets->p1.push_back(p1target); }
+        if (p2target) { sets->p2.push_back(p2target); }
         std::sort(sets->p1.begin(), sets->p1.end());
         std::sort(sets->p2.begin(), sets->p2.end());
         sets->p2pc = p2objs.empty() ? 0 : p2ctrl;

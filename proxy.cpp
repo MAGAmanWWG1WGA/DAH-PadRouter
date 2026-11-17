@@ -23,6 +23,7 @@
 #include <Xinput.h>
 #include <intrin.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdarg>
@@ -90,6 +91,8 @@ struct Config
     // that player's own view (the game measures from there). Re-read while the game runs.
     float AimP1X = 0.25f, AimP2X = 0.25f;   // left/right split
     float AimP1Y0 = 0.0f, AimP2Y0 = 0.0f;   // top/bottom split: added to the half-height aim point
+    int PlayerContext = 1;         // 1 = the game's code asking for "the player" while working on
+                                   //     Player 2's things gets Player 2 (lock-on, aiming, pickups)
 };
 static Config g_Cfg;
 
@@ -124,6 +127,7 @@ static void LoadConfig()
         else if (key == "PlayerInputAxisSlot") { g_Cfg.PlayerInputAxisSlot = int(v); }
         else if (key == "AimFix") { g_Cfg.AimFix = int(v); }
         else if (key == "AimP1X") { g_Cfg.AimP1X = fv; }
+        else if (key == "PlayerContext") { g_Cfg.PlayerContext = int(v); }
         else if (key == "AimP2X") { g_Cfg.AimP2X = fv; }
         else if (key == "AimP1Y0") { g_Cfg.AimP1Y0 = fv; }
         else if (key == "AimP2Y0") { g_Cfg.AimP2Y0 = fv; }
@@ -796,6 +800,7 @@ static FVec2* AimCrosshairHook(uint8_t* tc, FVec2* out)
     return out;
 }
 
+static uintptr_t g_AimFn = 0;
 static void InstallAimFix()
 {
     // 48 89 5C 24 08 57 48 83 EC 20 48 8B 05 <GEngine> 48 8B DA 48 8B F9 ... (see the comment above)
@@ -851,8 +856,219 @@ static void InstallAimFix()
     VirtualProtect(reinterpret_cast<void*>(found), sizeof(patch), old, &old);
     FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(found), sizeof(patch));
     g_AimFixOn = true;
+    g_AimFn = found;
     Log("Aim fix: installed at %p (GEngine %p, offsets %X/%X/%X/%X/%X)", (void*)found, (void*)g_GEnginePtr,
         g_OffGameViewport, g_OffViewport, g_OffAltFlag, g_OffAltOffset, g_OffOffset);
+}
+
+// ============================================================================
+// Player context: "which player is this code working for?"
+// ----------------------------------------------------------------------------
+// The game's own code (BFGCore) asks the world for "the first player controller" in
+// ~130 places: to aim, lock on, project targets onto the screen, pick things up... In
+// split screen that always answers Player 1. We replace that question with a version
+// that looks at what the calling code is working on (the CPU registers that hold its
+// objects): if it's one of Player 2's objects (character, components, weapons,
+// abilities...), it gets Player 2's controller. Player 2's code then also measures the
+// screen from the corner of Player 2's own view (project/deproject below), the same way
+// the aim point does. The object lists come from the DAHPadLink handshake (p1obj=/p2obj=).
+// ============================================================================
+struct PlayerSets
+{
+    std::vector<uintptr_t> p1, p2;  // sorted
+    uintptr_t p2pc = 0;
+};
+static std::atomic<const PlayerSets*> g_Sets{nullptr};
+static uintptr_t g_BfgBegin = 0, g_BfgEnd = 0;     // where the game's own code lives
+static uintptr_t g_GfpcWeakGet = 0;                 // TWeakObjectPtr::Get used by GetFirstPlayerController
+static int32_t g_OffPcList = 0, g_OffPcCount = 0;   // UWorld::PlayerControllerList data / count
+static uintptr_t g_ProjectInner = 0, g_DeprojectInner = 0;
+static std::atomic<long> g_CtxP2Hits{0};
+
+using WeakGetFn = void* (*)(void* weakPtr);
+static void* OriginalFirstPC(uint8_t* world)
+{
+    if (!world || *reinterpret_cast<int32_t*>(world + g_OffPcCount) <= 0) { return nullptr; }
+    void* data = *reinterpret_cast<void**>(world + g_OffPcList);
+    return reinterpret_cast<WeakGetFn>(g_GfpcWeakGet)(data);
+}
+
+static bool InSet(const std::vector<uintptr_t>& v, uintptr_t x)
+{
+    return x && std::binary_search(v.begin(), v.end(), x);
+}
+
+// regs: rbx, rdi, rsi, r14, r15, r12, r13, rbp (in that order: most likely "this" first)
+static void* FirstPCHook(uint8_t* world, const uintptr_t* regs, uintptr_t ret)
+{
+    const PlayerSets* s = g_Sets.load(std::memory_order_acquire);
+    if (s && s->p2pc && g_Cfg.PlayerContext && ret >= g_BfgBegin && ret < g_BfgEnd)
+    {
+        for (int i = 0; i < 8; ++i)
+        {
+            if (InSet(s->p2, regs[i])) { g_CtxP2Hits.fetch_add(1, std::memory_order_relaxed); return reinterpret_cast<void*>(s->p2pc); }
+            if (InSet(s->p1, regs[i])) { break; }
+        }
+    }
+    return OriginalFirstPC(world);
+}
+
+static bool IsP2Controller(const void* pc)
+{
+    const PlayerSets* s = g_Sets.load(std::memory_order_acquire);
+    return s && s->p2pc && reinterpret_cast<uintptr_t>(pc) == s->p2pc;
+}
+
+static bool ViewportSizeF(float& w, float& h)
+{
+    const uintptr_t engine = g_GEnginePtr ? *g_GEnginePtr : 0;
+    if (!engine) { return false; }
+    const uintptr_t gv = *reinterpret_cast<uintptr_t*>(engine + g_OffGameViewport);
+    if (!gv) { return false; }
+    void* vp = *reinterpret_cast<void**>(gv + g_OffViewport);
+    if (!vp) { return false; }
+    auto vtable = *reinterpret_cast<uintptr_t**>(vp);
+    FIntPt size{};
+    const FIntPt* r = reinterpret_cast<GetSizeXYFn>(vtable[3])(vp, &size);
+    w = float(r->X);
+    h = float(r->Y);
+    return w > 0 && h > 0;
+}
+
+struct FVec3 { float X, Y, Z; };
+using ProjectInnerFn = bool (*)(const void* pc, const FVec3* world, FVec2* screen, bool relative);
+using DeprojectInnerFn = bool (*)(const void* pc, const FVec2* screen, FVec3* loc, FVec3* dir);
+
+// APlayerController::ProjectWorldLocationToScreen: Player 2 gets positions measured
+// from the corner of their own view, like their aim point.
+static bool ProjectHook(const void* pc, const FVec3* world, FVec2* screen, bool relative)
+{
+    if (g_Cfg.PlayerContext && IsP2Controller(pc)) { relative = true; }
+    return reinterpret_cast<ProjectInnerFn>(g_ProjectInner)(pc, world, screen, relative);
+}
+
+// APlayerController::DeprojectScreenPositionToWorld: the engine wants whole-screen pixels,
+// so add the corner of Player 2's view back on.
+static bool DeprojectHook(const void* pc, float x, float y, FVec3* loc, FVec3* dir)
+{
+    if (g_Cfg.PlayerContext && IsP2Controller(pc))
+    {
+        float w = 0, h = 0;
+        if (ViewportSizeF(w, h))
+        {
+            if (g_LayoutVertical.load(std::memory_order_relaxed)) { x += w * 0.5f; }
+            else { y += h * 0.5f; }
+        }
+    }
+    const FVec2 sp{x, y};
+    return reinterpret_cast<DeprojectInnerFn>(g_DeprojectInner)(pc, &sp, loc, dir);
+}
+
+static std::vector<int> ParsePattern(const char* text)
+{
+    std::vector<int> pat;
+    for (const char* p = text; *p;)
+    {
+        if (*p == ' ') { ++p; continue; }
+        if (p[0] == '?') { pat.push_back(-1); p += 2; continue; }
+        pat.push_back(int(std::strtol(std::string(p, 2).c_str(), nullptr, 16)));
+        p += 2;
+    }
+    return pat;
+}
+
+static uintptr_t FindUnique(const char* text, const char* what)
+{
+    const std::vector<int> pat = ParsePattern(text);
+    uintptr_t found = 0;
+    int matches = 0;
+    for (uintptr_t a = g_Text.begin; a + pat.size() < g_Text.end; ++a)
+    {
+        const uint8_t* b = reinterpret_cast<const uint8_t*>(a);
+        if (b[0] != pat[0]) { continue; }
+        size_t i = 1;
+        for (; i < pat.size(); ++i) { if (pat[i] >= 0 && b[i] != pat[i]) { break; } }
+        if (i == pat.size()) { if (!found) { found = a; } ++matches; }
+    }
+    if (matches != 1) { Log("Player context: %s %s (%d matches)", what, matches ? "ambiguous" : "not found", matches); return 0; }
+    return found;
+}
+
+static uintptr_t Rel32Target(uintptr_t at)  // at = address of the E8/E9 byte
+{
+    int32_t d;
+    std::memcpy(&d, reinterpret_cast<void*>(at + 1), 4);
+    return at + 5 + d;
+}
+
+static bool WriteCode(uintptr_t at, const void* bytes, size_t n)
+{
+    DWORD old = 0;
+    if (!VirtualProtect(reinterpret_cast<void*>(at), n, PAGE_EXECUTE_READWRITE, &old)) { return false; }
+    std::memcpy(reinterpret_cast<void*>(at), bytes, n);
+    VirtualProtect(reinterpret_cast<void*>(at), n, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(at), n);
+    return true;
+}
+
+static bool JumpTo(uintptr_t at, uintptr_t target)
+{
+    uint8_t patch[14] = {0xFF, 0x25, 0, 0, 0, 0};
+    std::memcpy(patch + 6, &target, 8);
+    return WriteCode(at, patch, sizeof(patch));
+}
+
+static void InstallPlayerContext(uintptr_t aimFn)
+{
+    if (!aimFn || !g_GEnginePtr) { Log("Player context: needs the aim fix; skipped"); return; }
+    const uintptr_t gfpc = FindUnique("83 B9 ?? ?? ?? ?? 00 7E ?? 48 8B 89 ?? ?? ?? ?? E9 ?? ?? ?? ?? 33 C0 C3",
+                                      "GetFirstPlayerController");
+    const uintptr_t project = FindUnique(
+        "48 83 EC 28 E8 ?? ?? ?? ?? 48 83 C4 28 C3 CC CC 48 89 5C 24 10 48 89 6C 24 18 48 89 74 24 20 57 "
+        "48 81 EC 20 01 00 00 48 8B 99", "ProjectWorldLocationToScreen");
+    const uintptr_t deproject = FindUnique(
+        "48 83 EC 38 4D 8B C1 F3 0F 11 4C 24 20 4C 8B 4C 24 60 48 8D 54 24 20 F3 0F 11 54 24 24 E8 ?? ?? ?? ?? "
+        "48 83 C4 38 C3", "DeprojectScreenPositionToWorld");
+    if (!gfpc || !project || !deproject) { Log("Player context: not installed (game code differs)"); return; }
+
+    std::memcpy(&g_OffPcCount, reinterpret_cast<void*>(gfpc + 2), 4);
+    std::memcpy(&g_OffPcList, reinterpret_cast<void*>(gfpc + 12), 4);
+    g_GfpcWeakGet = Rel32Target(gfpc + 16);
+    g_ProjectInner = Rel32Target(project + 4);
+    g_DeprojectInner = Rel32Target(deproject + 29);
+    g_BfgBegin = aimFn - 0x180000;
+    g_BfgEnd = aimFn + 0x300000;
+
+    // Register-capturing stub for GetFirstPlayerController (see FirstPCHook).
+    static const uint8_t kStub[] = {
+        0x48, 0x83, 0xEC, 0x68,              // sub rsp, 0x68
+        0x48, 0x89, 0x5C, 0x24, 0x20,        // mov [rsp+20h], rbx
+        0x48, 0x89, 0x7C, 0x24, 0x28,        // mov [rsp+28h], rdi
+        0x48, 0x89, 0x74, 0x24, 0x30,        // mov [rsp+30h], rsi
+        0x4C, 0x89, 0x74, 0x24, 0x38,        // mov [rsp+38h], r14
+        0x4C, 0x89, 0x7C, 0x24, 0x40,        // mov [rsp+40h], r15
+        0x4C, 0x89, 0x64, 0x24, 0x48,        // mov [rsp+48h], r12
+        0x4C, 0x89, 0x6C, 0x24, 0x50,        // mov [rsp+50h], r13
+        0x48, 0x89, 0x6C, 0x24, 0x58,        // mov [rsp+58h], rbp
+        0x48, 0x8D, 0x54, 0x24, 0x20,        // lea rdx, [rsp+20h]
+        0x4C, 0x8B, 0x44, 0x24, 0x68,        // mov r8, [rsp+68h]   (return address)
+        0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0,  // mov rax, FirstPCHook
+        0xFF, 0xD0,                          // call rax
+        0x48, 0x83, 0xC4, 0x68,              // add rsp, 0x68
+        0xC3,                                // ret
+    };
+    auto stub = static_cast<uint8_t*>(VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!stub) { Log("Player context: no memory for the stub"); return; }
+    std::memcpy(stub, kStub, sizeof(kStub));
+    const uintptr_t hook = reinterpret_cast<uintptr_t>(&FirstPCHook);
+    std::memcpy(stub + 56, &hook, 8);
+    FlushInstructionCache(GetCurrentProcess(), stub, sizeof(kStub));
+
+    const bool ok = JumpTo(gfpc, reinterpret_cast<uintptr_t>(stub)) &&
+                    JumpTo(project, reinterpret_cast<uintptr_t>(&ProjectHook)) &&
+                    JumpTo(deproject, reinterpret_cast<uintptr_t>(&DeprojectHook));
+    Log("Player context: %s (first-player %p, project %p, deproject %p, game code %p-%p)",
+        ok ? "installed" : "FAILED", (void*)gfpc, (void*)project, (void*)deproject, (void*)g_BfgBegin, (void*)g_BfgEnd);
 }
 
 static FILETIME g_HandshakeTime{};
@@ -895,8 +1111,9 @@ static void ApplyHandshake()
 
     uintptr_t viewport = 0;
     uintptr_t p1input = 0, p2input = 0;
-    uintptr_t p1target = 0, p2target = 0;
+    uintptr_t p1target = 0, p2target = 0, p2ctrl = 0;
     int layoutVertical = 1;
+    std::vector<uintptr_t> p1objs, p2objs;
     int found = 0;
     for (const auto& line : lines)
     {
@@ -920,6 +1137,18 @@ static void ApplyHandshake()
         {
             p2target = static_cast<uintptr_t>(std::strtoull(line.c_str() + 9, nullptr, 0));
         }
+        else if (line.rfind("p1obj=", 0) == 0)
+        {
+            p1objs.push_back(static_cast<uintptr_t>(std::strtoull(line.c_str() + 6, nullptr, 0)));
+        }
+        else if (line.rfind("p2obj=", 0) == 0)
+        {
+            p2objs.push_back(static_cast<uintptr_t>(std::strtoull(line.c_str() + 6, nullptr, 0)));
+        }
+        else if (line.rfind("p2ctrl=", 0) == 0)
+        {
+            p2ctrl = static_cast<uintptr_t>(std::strtoull(line.c_str() + 7, nullptr, 0));
+        }
         else if (line.rfind("layout=", 0) == 0)
         {
             layoutVertical = line.compare(7, 8, "vertical") == 0 ? 1 : 0;
@@ -936,6 +1165,19 @@ static void ApplyHandshake()
         }
     }
     Log("Handshake read: viewport=%p, %d of %d key names", (void*)viewport, found, int(BK_Count + AK_Count));
+    {
+        // New object lists for the player-context hook (old lists are kept: they are tiny,
+        // and a game thread may still be reading one).
+        auto sets = new PlayerSets();
+        sets->p1 = p1objs;
+        sets->p2 = p2objs;
+        std::sort(sets->p1.begin(), sets->p1.end());
+        std::sort(sets->p2.begin(), sets->p2.end());
+        sets->p2pc = p2objs.empty() ? 0 : p2ctrl;
+        g_Sets.store(sets, std::memory_order_release);
+        Log("Player context: %zu Player 1 objects, %zu Player 2 objects, P2 controller %p, %ld P2 answers so far",
+            sets->p1.size(), sets->p2.size(), (void*)sets->p2pc, g_CtxP2Hits.load());
+    }
     if (p1target != g_P1Target.load() || p2target != g_P2Target.load() || layoutVertical != g_LayoutVertical.load())
     {
         g_P1Target = p1target;
@@ -1221,6 +1463,7 @@ static DWORD WINAPI Worker(LPVOID)
 
     if (g_Cfg.AimFix) { InstallAimFix(); }
     else { Log("Aim fix: off (AimFix=0 in DAHPadRouter.ini)"); }
+    InstallPlayerContext(g_AimFn);
 
     Probe probe;
     bool probeWas = false, toggleWas = false, probeInputWas = false;

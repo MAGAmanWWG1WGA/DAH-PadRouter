@@ -54,7 +54,12 @@ jobs:
           # Remove this repo's wrapper xmake.lua so xmake can't pick it as the main project.
           Remove-Item xmake.lua -ErrorAction SilentlyContinue
           Add-Content RE-UE4SS/xmake.lua "`nincludes(`"DAHPadRouter`")"
-          Get-Content RE-UE4SS/xmake.lua -Tail 5
+          # Tell the compiler to target Windows 10 for every UE4SS target. Without this the
+          # Unreal headers stop with "Windows Vista and earlier are no longer supported".
+          $root = Get-Content RE-UE4SS/xmake.lua -Raw
+          $defs = "add_defines(`"WINVER=0x0A00`", `"_WIN32_WINNT=0x0A00`")`n"
+          Set-Content RE-UE4SS/xmake.lua ($defs + $root) -NoNewline
+          Get-Content RE-UE4SS/xmake.lua -TotalCount 3; Get-Content RE-UE4SS/xmake.lua -Tail 3
 
       - name: Install xmake
         uses: xmake-io/github-action-setup-xmake@v1

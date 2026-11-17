@@ -80,6 +80,16 @@ jobs:
           path: ~\AppData\Local\.xmake\packages
           key: xmake-${{ github.event.inputs.xmake_version || '3.0.1' }}-packages-${{ github.event.inputs.ue4ss_ref || '1ceefac8' }}
 
+      - name: Hide the preinstalled ninja (it breaks xmake's package installs)
+        shell: pwsh
+        run: |
+          Get-Command ninja -All -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host "Hiding $($_.Source)"
+            Rename-Item $_.Source "$($_.Source).hidden" -ErrorAction SilentlyContinue
+          }
+          if (Get-Command ninja -ErrorAction SilentlyContinue) { Write-Host "::warning::ninja is still on PATH" }
+          else { Write-Host "ninja hidden" }
+
       - name: Set up packages (retries up to 3 times)
         shell: pwsh
         working-directory: RE-UE4SS

@@ -25,6 +25,9 @@ local function log(fmt, ...)
     print(string.format("[%s] " .. fmt .. "\n", MOD, ...))
 end
 
+-- Remove the previous session's handshake so the DLL never reads a stale address.
+os.remove(FILE)
+
 local lastAddress = nil
 local keyLines = nil
 local failedOnce = false

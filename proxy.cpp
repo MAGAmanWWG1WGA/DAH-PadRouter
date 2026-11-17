@@ -334,7 +334,8 @@ static std::atomic<uintptr_t> g_P2Input{0};   // Player 2's PlayerInput (where p
 static std::atomic<uintptr_t> g_InputVTable{0};
 static std::atomic<PIKeyFn> g_PIKey{nullptr};
 static std::atomic<PIAxisFn> g_PIAxis{nullptr};
-static std::atomic<bool> g_ResetPad{false};   // Player 2 changed: forget held buttons without sending
+static std::atomic<bool> g_ResetPad{false};
+static std::atomic<bool> g_SpawnRequested{false};  // Start pressed on pad 2 while Player 2 doesn't exist   // Player 2 changed: forget held buttons without sending
 
 static std::atomic<uintptr_t> g_ViewportObj{0};
 static std::atomic<uintptr_t> g_ViewportPart{0};
@@ -625,6 +626,13 @@ extern "C" DWORD WINAPI Proxy_XInputGetState(DWORD userIndex, XINPUT_STATE* stat
     const bool fromGame = CalledByGame(caller);
 
     const bool connected = result == ERROR_SUCCESS && state;
+
+    // Start on Player 2's pad before Player 2 exists = ask DAH2P to spawn Player 2.
+    static bool startWasDown = false;
+    const bool startDown = connected && (state->Gamepad.wButtons & XINPUT_GAMEPAD_START) != 0;
+    if (fromGame && startDown && !startWasDown && !g_P2Input.load()) { g_SpawnRequested = true; }
+    startWasDown = startDown;
+
     XINPUT_GAMEPAD pad{};
     if (connected)
     {
@@ -1080,6 +1088,27 @@ static DWORD WINAPI Worker(LPVOID)
         }
 
         probe.Update();
+
+        // Pass a "spawn Player 2" request to the DAH2P Lua mod (it polls for this file).
+        static ULONGLONG lastSpawnRequest = 0;
+        if (g_SpawnRequested.exchange(false) && now - lastSpawnRequest > 3000)
+        {
+            lastSpawnRequest = now;
+            const std::wstring paths[] = {L"padrouter_spawn_request.txt", g_ExeDir + L"\\ue4ss\\padrouter_spawn_request.txt"};
+            bool written = false;
+            for (const auto& path : paths)
+            {
+                if (FILE* f = _wfopen(path.c_str(), L"w"))
+                {
+                    std::fputs("spawn\n", f);
+                    std::fclose(f);
+                    written = true;
+                    break;
+                }
+            }
+            Log(written ? "Start on pad %d: asked DAH2P to spawn Player 2" : "Start on pad %d: could not write the spawn request",
+                g_Cfg.HidePadIndex);
+        }
 
         const bool chord = GameHasFocus() && Down(VK_CONTROL) && Down(VK_SHIFT);
         const bool probeKey = chord && Down('P');

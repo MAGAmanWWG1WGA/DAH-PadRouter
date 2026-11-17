@@ -459,12 +459,20 @@ static void SendAxis(int index, float value, float dt)
 {
     if (g_Cfg.Mode == 1)
     {
-        auto fn = g_PIAxis.load();
         const uintptr_t input = g_P2Input.load();
-        if (!fn || !PlayerInputValid(input)) { return; }
+        if (!PlayerInputValid(input)) { return; }
         FKeyRaw key{};
         key.Name = g_AxisFNames[index];
-        fn(reinterpret_cast<void*>(input), &key, value, dt, 1, true);
+        if (auto axisFn = g_PIAxis.load())
+        {
+            axisFn(reinterpret_cast<void*>(input), &key, value, dt, 1, true);
+        }
+        else if (auto keyFn = g_PIKey.load())
+        {
+            // UPlayerInput::InputKey stores AmountDepressed as the key's raw value, so a
+            // "press" with the stick/trigger value sets that axis, and a release sets it to 0.
+            keyFn(reinterpret_cast<void*>(input), &key, value != 0.0f ? 0 : 1, value, true);
+        }
         return;
     }
 
@@ -481,7 +489,7 @@ static void SendAxis(int index, float value, float dt)
 static bool InjectionReady()
 {
     if (g_Probing || !g_NamesReady) { return false; }
-    if (g_Cfg.Mode == 1) { return g_PIKey.load() && g_PIAxis.load() && g_P2Input.load(); }
+    if (g_Cfg.Mode == 1) { return g_PIKey.load() && g_P2Input.load(); }  // axis slot is optional
     return g_InputKey.load() && g_InputAxis.load() && g_ViewportPart.load();
 }
 
@@ -786,13 +794,16 @@ static void ApplyHandshake()
             const int slots = CountVTableEntries(vt);
             PIKeyFn keyFn = nullptr;
             PIAxisFn axisFn = nullptr;
-            if (g_Cfg.PlayerInputKeySlot > 0 && g_Cfg.PlayerInputAxisSlot > 0 &&
-                g_Cfg.PlayerInputKeySlot < slots && g_Cfg.PlayerInputAxisSlot < slots)
+            if (g_Cfg.PlayerInputKeySlot > 0 && g_Cfg.PlayerInputKeySlot < slots)
             {
-                uintptr_t k{}, a{};
+                uintptr_t k{};
                 SafeReadPtr(vt + g_Cfg.PlayerInputKeySlot * sizeof(void*), k);
-                SafeReadPtr(vt + g_Cfg.PlayerInputAxisSlot * sizeof(void*), a);
                 keyFn = reinterpret_cast<PIKeyFn>(k);
+            }
+            if (g_Cfg.PlayerInputAxisSlot > 0 && g_Cfg.PlayerInputAxisSlot < slots)
+            {
+                uintptr_t a{};
+                SafeReadPtr(vt + g_Cfg.PlayerInputAxisSlot * sizeof(void*), a);
                 axisFn = reinterpret_cast<PIAxisFn>(a);
             }
             g_PIKey = keyFn;
@@ -803,7 +814,11 @@ static void ApplyHandshake()
                 sameClass ? "" : "  WARNING: P1 and P2 use different PlayerInput classes");
             if (g_Cfg.Mode == 1)
             {
-                if (keyFn && p2input) { Log("Routing ready (PlayerInput): key slot %d, axis slot %d", g_Cfg.PlayerInputKeySlot, g_Cfg.PlayerInputAxisSlot); }
+                if (keyFn && p2input)
+                {
+                    Log("Routing ready (PlayerInput): key slot %d, %s", g_Cfg.PlayerInputKeySlot,
+                        axisFn ? "axis slot set" : "sticks/triggers sent through the key slot");
+                }
                 else if (!keyFn) { Log("PlayerInput slots not set. Load a save and press Ctrl+Shift+I to probe them."); }
                 else { Log("Player 2 not spawned yet (press Ctrl+Y)"); }
             }

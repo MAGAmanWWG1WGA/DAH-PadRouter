@@ -15,7 +15,7 @@ on:
 jobs:
   build:
     runs-on: windows-2022
-    timeout-minutes: 90
+    timeout-minutes: 350
     steps:
       - name: Check out this repo
         uses: actions/checkout@v4
@@ -46,7 +46,13 @@ jobs:
         with:
           xmake-version: latest
 
-      - name: Build
+      - name: Reuse downloaded packages from earlier runs
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\.xmake\packages
+          key: xmake-packages-${{ github.event.inputs.ue4ss_ref || '1ceefac8' }}
+
+      - name: Set up packages (retries up to 3 times)
         shell: pwsh
         run: |
           $ok = $false
@@ -62,6 +68,10 @@ jobs:
               ForEach-Object { Write-Host "===== $($_.FullName)"; Get-Content $_.FullName -Tail 80 }
             exit 1
           }
+
+      - name: Compile UE4SS and the mod (slow, 1-3 hours the first time)
+        shell: pwsh
+        run: |
           xmake build -y DAHPadRouter
           if ($LASTEXITCODE -ne 0) { exit 1 }
 

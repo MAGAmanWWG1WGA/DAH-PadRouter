@@ -127,6 +127,8 @@ using XInputGetDSoundAudioDeviceGuidsFn = DWORD(WINAPI*)(DWORD, GUID*, GUID*);
 using XInputGetBatteryInformationFn = DWORD(WINAPI*)(DWORD, BYTE, XINPUT_BATTERY_INFORMATION*);
 using XInputGetKeystrokeFn = DWORD(WINAPI*)(DWORD, DWORD, PXINPUT_KEYSTROKE);
 using XInputGetAudioDeviceIdsFn = DWORD(WINAPI*)(DWORD, LPWSTR, UINT*, LPWSTR, UINT*);
+using XInputWaitForGuideButtonFn = DWORD(WINAPI*)(DWORD, DWORD, LPVOID);
+using XInputUserIndexFn = DWORD(WINAPI*)(DWORD);
 
 static struct RealXInput
 {
@@ -140,6 +142,9 @@ static struct RealXInput
     XInputGetBatteryInformationFn GetBatteryInformation = nullptr;
     XInputGetKeystrokeFn GetKeystroke = nullptr;
     XInputGetAudioDeviceIdsFn GetAudioDeviceIds = nullptr;
+    XInputWaitForGuideButtonFn WaitForGuideButton = nullptr;  // ordinal 101
+    XInputUserIndexFn CancelGuideButtonWait = nullptr;        // ordinal 102
+    XInputUserIndexFn PowerOffController = nullptr;           // ordinal 103
 } g_Real;
 
 static void StartWorker();
@@ -183,6 +188,9 @@ static void LoadRealXInput()
         g_Real.GetBatteryInformation = reinterpret_cast<XInputGetBatteryInformationFn>(get("XInputGetBatteryInformation"));
         g_Real.GetKeystroke = reinterpret_cast<XInputGetKeystrokeFn>(get("XInputGetKeystroke"));
         g_Real.GetAudioDeviceIds = reinterpret_cast<XInputGetAudioDeviceIdsFn>(get("XInputGetAudioDeviceIds"));
+        g_Real.WaitForGuideButton = reinterpret_cast<XInputWaitForGuideButtonFn>(GetProcAddress(g_Real.module, MAKEINTRESOURCEA(101)));
+        g_Real.CancelGuideButtonWait = reinterpret_cast<XInputUserIndexFn>(GetProcAddress(g_Real.module, MAKEINTRESOURCEA(102)));
+        g_Real.PowerOffController = reinterpret_cast<XInputUserIndexFn>(GetProcAddress(g_Real.module, MAKEINTRESOURCEA(103)));
 
         InitModuleRanges();
         StartWorker();
@@ -560,6 +568,24 @@ extern "C" DWORD WINAPI Proxy_XInputGetAudioDeviceIds(DWORD userIndex, LPWSTR re
 {
     LoadRealXInput();
     return g_Real.GetAudioDeviceIds ? g_Real.GetAudioDeviceIds(userIndex, render, renderCount, capture, captureCount) : ERROR_DEVICE_NOT_CONNECTED;
+}
+
+extern "C" DWORD WINAPI Proxy_XInputWaitForGuideButton(DWORD userIndex, DWORD flags, LPVOID overlapped)
+{
+    LoadRealXInput();
+    return g_Real.WaitForGuideButton ? g_Real.WaitForGuideButton(userIndex, flags, overlapped) : ERROR_DEVICE_NOT_CONNECTED;
+}
+
+extern "C" DWORD WINAPI Proxy_XInputCancelGuideButtonWait(DWORD userIndex)
+{
+    LoadRealXInput();
+    return g_Real.CancelGuideButtonWait ? g_Real.CancelGuideButtonWait(userIndex) : ERROR_DEVICE_NOT_CONNECTED;
+}
+
+extern "C" DWORD WINAPI Proxy_XInputPowerOffController(DWORD userIndex)
+{
+    LoadRealXInput();
+    return g_Real.PowerOffController ? g_Real.PowerOffController(userIndex) : ERROR_DEVICE_NOT_CONNECTED;
 }
 
 // ============================================================================

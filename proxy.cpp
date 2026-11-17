@@ -913,6 +913,25 @@ static void* FirstPCHook(uint8_t* world, const uintptr_t* regs, uintptr_t ret)
     return OriginalFirstPC(world);
 }
 
+// UGameInstance::GetFirstLocalPlayerController: the HUD (radar, shield bar, threat display)
+// asks this one instead of the world. Same rule as above; the original runs from a small
+// copy of its first instructions (the "trampoline").
+using FirstLocalPCFn = void* (*)(void* gameInstance);
+static FirstLocalPCFn g_FirstLocalPCOrig = nullptr;
+static void* FirstLocalPCHook(void* gameInstance, const uintptr_t* regs, uintptr_t ret)
+{
+    const PlayerSets* s = g_Sets.load(std::memory_order_acquire);
+    if (s && s->p2pc && g_Cfg.PlayerContext && ret >= g_BfgBegin && ret < g_BfgEnd)
+    {
+        for (int i = 0; i < 8; ++i)
+        {
+            if (InSet(s->p2, regs[i])) { g_CtxP2Hits.fetch_add(1, std::memory_order_relaxed); return reinterpret_cast<void*>(s->p2pc); }
+            if (InSet(s->p1, regs[i])) { break; }
+        }
+    }
+    return g_FirstLocalPCOrig(gameInstance);
+}
+
 static bool IsP2Controller(const void* pc)
 {
     const PlayerSets* s = g_Sets.load(std::memory_order_acquire);
@@ -1113,6 +1132,36 @@ static void InstallPlayerContext(uintptr_t aimFn)
         else
         {
             Log("Player context: TargetSystem helper not found (%d matches)", count);
+        }
+    }
+    // GetFirstLocalPlayerController (HUD widgets).
+    {
+        const uintptr_t flpc = FindUnique("48 83 EC 38 48 8B 41 30 48 85 C0 74 09 48 8B 88 ?? ?? ?? ?? EB 02 33 C9 48 8D 54 24 20 E8",
+                                          "GetFirstLocalPlayerController");
+        auto mem = flpc ? static_cast<uint8_t*>(VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)) : nullptr;
+        if (mem)
+        {
+            // trampoline: the original's first 20 bytes, then back into it
+            uint8_t* t = mem;
+            std::memcpy(t, reinterpret_cast<void*>(flpc), 11);      // sub rsp,38h / mov rax,[rcx+30h] / test rax,rax
+            t[11] = 0x74; t[12] = 21;                               // je  -> null path below
+            std::memcpy(t + 13, reinterpret_cast<void*>(flpc + 13), 7); // mov rcx,[rax+off]
+            uint8_t jmp1[14] = {0xFF, 0x25, 0, 0, 0, 0};
+            const uintptr_t back1 = flpc + 0x14, back2 = flpc + 0x16;
+            std::memcpy(jmp1 + 6, &back1, 8);
+            std::memcpy(t + 20, jmp1, 14);                          // jmp back after the copied code
+            std::memcpy(jmp1 + 6, &back2, 8);
+            std::memcpy(t + 34, jmp1, 14);                          // null path: jmp to the original's "xor ecx,ecx"
+            g_FirstLocalPCOrig = reinterpret_cast<FirstLocalPCFn>(t);
+
+            // register-capturing stub (same layout as the first-player one)
+            uint8_t* st = mem + 64;
+            std::memcpy(st, kStub, sizeof(kStub));
+            const uintptr_t hook2 = reinterpret_cast<uintptr_t>(&FirstLocalPCHook);
+            std::memcpy(st + 56, &hook2, 8);
+            FlushInstructionCache(GetCurrentProcess(), mem, 4096);
+            Log("Player context: HUD first-local-player %p %s", (void*)flpc,
+                JumpTo(flpc, reinterpret_cast<uintptr_t>(st)) ? "hooked" : "FAILED");
         }
     }
     Log("Player context: %s (first-player %p, project %p, deproject %p, game code %p-%p)",

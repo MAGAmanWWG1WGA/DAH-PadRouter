@@ -51,6 +51,8 @@ jobs:
         shell: pwsh
         run: |
           Copy-Item -Recurse DAHPadRouter RE-UE4SS/DAHPadRouter
+          # Remove this repo's wrapper xmake.lua so xmake can't pick it as the main project.
+          Remove-Item xmake.lua -ErrorAction SilentlyContinue
           Add-Content RE-UE4SS/xmake.lua "`nincludes(`"DAHPadRouter`")"
           Get-Content RE-UE4SS/xmake.lua -Tail 5
 
@@ -71,8 +73,8 @@ jobs:
         run: |
           $ok = $false
           for ($i = 1; $i -le 3; $i++) {
-            if ($i -lt 3) { xmake f -m "Game__Shipping__Win64" -y }
-            else { xmake f -m "Game__Shipping__Win64" -y -vD }   # last try: print full error details
+            if ($i -lt 3) { xmake f -P . -m "Game__Shipping__Win64" -y }
+            else { xmake f -P . -m "Game__Shipping__Win64" -y -vD }   # last try: print full error details
             if ($LASTEXITCODE -eq 0) { $ok = $true; break }
             Write-Host "::warning::Package setup attempt $i failed, retrying"
           }
@@ -88,7 +90,7 @@ jobs:
         shell: pwsh
         working-directory: RE-UE4SS
         run: |
-          xmake build -y DAHPadRouter
+          xmake build -P . -y DAHPadRouter
           if ($LASTEXITCODE -ne 0) { exit 1 }
 
       - name: Package

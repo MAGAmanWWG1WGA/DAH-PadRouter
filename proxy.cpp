@@ -10,7 +10,7 @@
 // The viewport address and the gamepad key-name IDs come from the DAHPadLink Lua mod
 // (UE4SS), which writes them to padrouter_handshake.txt.
 //
-// Hotkeys (game focused): Ctrl+Shift+P = probe for the InputKey/InputAxis slots,
+// Hotkeys (game focused): Ctrl+Shift+L = write the call-site list to the log,
 //                         Ctrl+Shift+O = toggle on/off.
 // Files next to the game exe: DAHPadRouter.ini (settings), DAHPadRouter.log (log).
 
@@ -91,6 +91,7 @@ struct Config
     // that player's own view (the game measures from there). Re-read while the game runs.
     float AimP1X = 0.25f, AimP2X = 0.25f;   // left/right split
     float AimP1Y0 = 0.0f, AimP2Y0 = 0.0f;   // top/bottom split: added to the half-height aim point
+    int CallSiteLog = 1;           // 1 = log where the game still asks for "the player" (for fixing)
     int PlayerContext = 1;         // 1 = the game's code asking for "the player" while working on
                                    //     Player 2's things gets Player 2 (lock-on, aiming, pickups)
 };
@@ -128,6 +129,7 @@ static void LoadConfig()
         else if (key == "AimFix") { g_Cfg.AimFix = int(v); }
         else if (key == "AimP1X") { g_Cfg.AimP1X = fv; }
         else if (key == "PlayerContext") { g_Cfg.PlayerContext = int(v); }
+        else if (key == "CallSiteLog") { g_Cfg.CallSiteLog = int(v); }
         else if (key == "AimP2X") { g_Cfg.AimP2X = fv; }
         else if (key == "AimP1Y0") { g_Cfg.AimP1Y0 = fv; }
         else if (key == "AimP2Y0") { g_Cfg.AimP2Y0 = fv; }
@@ -885,6 +887,55 @@ static int32_t g_OffPcList = 0, g_OffPcCount = 0;   // UWorld::PlayerControllerL
 static uintptr_t g_ProjectInner = 0, g_DeprojectInner = 0;
 static std::atomic<long> g_CtxP2Hits{0};
 
+// ---- Call-site log -----------------------------------------------------------------
+// Counts, per place in the game's code, how each "who is the player?" question was answered
+// while Player 2 exists: for Player 2, for Player 1 (the code was busy with Player 1's things),
+// or "unknown" (nothing showed whose work it was, so it got Player 1). The "unknown" places
+// are where Player 2 can still be treated as Player 1. Written to the log every 30 s.
+enum { kCtxP2 = 0, kCtxP1 = 1, kCtxUnknown = 2 };
+static const int kSiteSlots = 4096;
+static std::atomic<uintptr_t> g_SiteKey[kSiteSlots];
+static std::atomic<uint32_t> g_SiteCount[kSiteSlots][3];
+static std::atomic<uint8_t> g_SiteKind[kSiteSlots];   // 1 = world first player, 2 = HUD first local player
+static void CountSite(uintptr_t ret, int outcome, uint8_t kind)
+{
+    if (!g_Cfg.CallSiteLog) { return; }
+    size_t h = (ret >> 2) * 2654435761u;
+    for (int n = 0; n < 64; ++n)
+    {
+        const size_t i = (h + n) & (kSiteSlots - 1);
+        uintptr_t k = g_SiteKey[i].load(std::memory_order_relaxed);
+        if (k == 0)
+        {
+            uintptr_t expected = 0;
+            if (g_SiteKey[i].compare_exchange_strong(expected, ret)) { g_SiteKind[i] = kind; k = ret; }
+            else { k = expected; }
+        }
+        if (k == ret) { g_SiteCount[i][outcome].fetch_add(1, std::memory_order_relaxed); return; }
+    }
+}
+static void DumpSites()
+{
+    const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    struct Row { uintptr_t ret; uint32_t c[3]; uint8_t kind; };
+    std::vector<Row> rows;
+    for (int i = 0; i < kSiteSlots; ++i)
+    {
+        const uintptr_t k = g_SiteKey[i].load();
+        if (!k) { continue; }
+        rows.push_back({k, {g_SiteCount[i][0].load(), g_SiteCount[i][1].load(), g_SiteCount[i][2].load()}, g_SiteKind[i].load()});
+    }
+    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.c[kCtxUnknown] > b.c[kCtxUnknown]; });
+    Log("=== Call sites asking 'who is the player?' (%zu places; most 'unknown' first) ===", rows.size());
+    size_t shown = 0;
+    for (const Row& r : rows)
+    {
+        if (++shown > 60) { break; }
+        Log("  site exe+0x%llX (%s): for P2 %u | for P1 %u | unknown %u", (unsigned long long)(r.ret - base),
+            r.kind == 2 ? "HUD" : "world", r.c[kCtxP2], r.c[kCtxP1], r.c[kCtxUnknown]);
+    }
+}
+
 using WeakGetFn = void* (*)(void* weakPtr);
 static void* OriginalFirstPC(uint8_t* world)
 {
@@ -904,11 +955,14 @@ static void* FirstPCHook(uint8_t* world, const uintptr_t* regs, uintptr_t ret)
     const PlayerSets* s = g_Sets.load(std::memory_order_acquire);
     if (s && s->p2pc && g_Cfg.PlayerContext && ret >= g_BfgBegin && ret < g_BfgEnd)
     {
+        int outcome = kCtxUnknown;
         for (int i = 0; i < 8; ++i)
         {
-            if (InSet(s->p2, regs[i])) { g_CtxP2Hits.fetch_add(1, std::memory_order_relaxed); return reinterpret_cast<void*>(s->p2pc); }
-            if (InSet(s->p1, regs[i])) { break; }
+            if (InSet(s->p2, regs[i])) { outcome = kCtxP2; break; }
+            if (InSet(s->p1, regs[i])) { outcome = kCtxP1; break; }
         }
+        CountSite(ret, outcome, 1);
+        if (outcome == kCtxP2) { g_CtxP2Hits.fetch_add(1, std::memory_order_relaxed); return reinterpret_cast<void*>(s->p2pc); }
     }
     return OriginalFirstPC(world);
 }
@@ -923,11 +977,14 @@ static void* FirstLocalPCHook(void* gameInstance, const uintptr_t* regs, uintptr
     const PlayerSets* s = g_Sets.load(std::memory_order_acquire);
     if (s && s->p2pc && g_Cfg.PlayerContext && ret >= g_BfgBegin && ret < g_BfgEnd)
     {
+        int outcome = kCtxUnknown;
         for (int i = 0; i < 8; ++i)
         {
-            if (InSet(s->p2, regs[i])) { g_CtxP2Hits.fetch_add(1, std::memory_order_relaxed); return reinterpret_cast<void*>(s->p2pc); }
-            if (InSet(s->p1, regs[i])) { break; }
+            if (InSet(s->p2, regs[i])) { outcome = kCtxP2; break; }
+            if (InSet(s->p1, regs[i])) { outcome = kCtxP1; break; }
         }
+        CountSite(ret, outcome, 2);
+        if (outcome == kCtxP2) { g_CtxP2Hits.fetch_add(1, std::memory_order_relaxed); return reinterpret_cast<void*>(s->p2pc); }
     }
     return g_FirstLocalPCOrig(gameInstance);
 }
@@ -1557,7 +1614,7 @@ static DWORD WINAPI Worker(LPVOID)
     g_MonitorUntil = GetTickCount64() + 180000;
     Log("Pad monitor ON for 3 minutes: press A on each pad to see which slot it is.");
     g_Enabled = g_Cfg.Enabled;
-    Log("Ctrl+Shift+I = probe PlayerInput slots | Ctrl+Shift+P = probe viewport slots | Ctrl+Shift+O = toggle on/off. "
+    Log("Ctrl+Shift+O = pad 2 routing on/off | Ctrl+Shift+L = write the call-site list now. "
         "Hiding pad %d from the game.", g_Cfg.HidePadIndex);
 
     if (g_Cfg.AimFix) { InstallAimFix(); }
@@ -1636,8 +1693,18 @@ static DWORD WINAPI Worker(LPVOID)
         }
 
         const bool chord = GameHasFocus() && Down(VK_CONTROL) && Down(VK_SHIFT);
-        const bool probeKey = chord && Down('P');
-        const bool probeInputKey = chord && Down('I');
+        const bool probeKey = false;        // old setup scans (Ctrl+Shift+P / I) are retired
+        const bool probeInputKey = false;
+        static bool dumpWas = false;
+        static ULONGLONG lastSiteDump = 0;
+        const bool dumpKey = chord && Down('L');
+        if (g_Cfg.CallSiteLog && ((dumpKey && !dumpWas) || now - lastSiteDump > 30000))
+        {
+            lastSiteDump = now;
+            const PlayerSets* cs = g_Sets.load();
+            if (dumpKey || (cs && cs->p2pc)) { DumpSites(); }
+        }
+        dumpWas = dumpKey;
         const bool toggleKey = chord && Down('O');
         if (probeKey && !probeWas)
         {

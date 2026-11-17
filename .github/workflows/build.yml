@@ -60,6 +60,20 @@ jobs:
           $defs = "add_defines(`"WINVER=0x0A00`", `"_WIN32_WINNT=0x0A00`")`n"
           Set-Content RE-UE4SS/xmake.lua ($defs + $root) -NoNewline
           Get-Content RE-UE4SS/xmake.lua -TotalCount 3; Get-Content RE-UE4SS/xmake.lua -Tail 3
+          # This xmake version can't ask the current MSVC for C++23, so ask for "latest" instead.
+          $changed = 0
+          Get-ChildItem RE-UE4SS -Recurse -Include *.lua -File |
+            Where-Object { $_.FullName -notmatch '\\.git\\' } |
+            ForEach-Object {
+              $text = Get-Content $_.FullName -Raw
+              if ($text -match '"(cxx|c\+\+)2[03]"') {
+                ($text -replace '"(cxx|c\+\+)2[03]"', '"cxxlatest"') | Set-Content $_.FullName -NoNewline
+                Write-Host "C++ version set to latest in $($_.FullName)"
+                $changed++
+              }
+            }
+          Write-Host "Files changed: $changed"
+          if ($changed -eq 0) { Write-Host "::warning::No C++ version setting found to change" }
 
       - name: Install xmake
         uses: xmake-io/github-action-setup-xmake@v1

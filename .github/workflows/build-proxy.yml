@@ -4,8 +4,10 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - "proxy/**"
-      - "DAHPadLink/**"
+      - "proxy.cpp"
+      - "xinput.def"
+      - "DAHPadRouter.ini"
+      - "main.lua"
       - ".github/workflows/build-proxy.yml"
 
 jobs:
@@ -25,7 +27,7 @@ jobs:
         shell: cmd
         run: |
           mkdir build
-          cl /nologo /O2 /EHsc /std:c++17 /MT /W3 /LD proxy\proxy.cpp /Fobuild\ /Fe:build\xinput1_3.dll /link /DEF:proxy\xinput.def user32.lib
+          cl /nologo /O2 /EHsc /std:c++17 /MT /W3 /LD proxy.cpp /Fobuild\ /Fe:build\xinput1_3.dll /link /DEF:xinput.def user32.lib
           if errorlevel 1 exit /b 1
 
       - name: Check the exports
@@ -40,8 +42,8 @@ jobs:
           Copy-Item build/xinput1_3.dll "$w/xinput1_3.dll"
           Copy-Item build/xinput1_3.dll "$w/xinput1_4.dll"
           Copy-Item build/xinput1_3.dll "$w/xinput9_1_0.dll"
-          Copy-Item proxy/DAHPadRouter.ini "$w/DAHPadRouter.ini"
-          Copy-Item DAHPadLink/Scripts/main.lua "$w/ue4ss/Mods/DAHPadLink/Scripts/main.lua"
+          Copy-Item DAHPadRouter.ini "$w/DAHPadRouter.ini"
+          Copy-Item main.lua "$w/ue4ss/Mods/DAHPadLink/Scripts/main.lua"
           Get-ChildItem -Recurse out | ForEach-Object { $_.FullName }
 
       - name: Upload

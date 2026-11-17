@@ -20,7 +20,7 @@ jobs:
       - name: Check out this repo
         uses: actions/checkout@v4
 
-      - name: Let git use your token (needed for UE4SS's private Unreal submodule)
+      - name: Let git use your token (only while downloading UE4SS)
         shell: pwsh
         env:
           TOKEN: ${{ secrets.UE4SS_GIT_TOKEN }}
@@ -31,6 +31,8 @@ jobs:
 
       - name: Download RE-UE4SS
         shell: pwsh
+        env:
+          TOKEN: ${{ secrets.UE4SS_GIT_TOKEN }}
         run: |
           $ref = "${{ github.event.inputs.ue4ss_ref }}"
           if (-not $ref) { $ref = "1ceefac8" }
@@ -40,24 +42,29 @@ jobs:
           if ($LASTEXITCODE -ne 0) { Write-Error "UE4SS version '$ref' not found"; exit 1 }
           git submodule update --init --recursive
           if ($LASTEXITCODE -ne 0) { Write-Error "Submodule download failed: is your GitHub account linked to Epic and the token correct? (README steps 1-4)"; exit 1 }
+          # Done with the token: remove it so package downloads use plain public access.
+          git config --global --remove-section url."https://x-access-token:$($env:TOKEN)@github.com/"
+          # Some packages are listed as git@github.com:... ; the build machine has no SSH key, so use https.
+          git config --global url."https://github.com/".insteadOf "git@github.com:"
 
       - name: Install xmake
         uses: xmake-io/github-action-setup-xmake@v1
         with:
-          xmake-version: latest
+          xmake-version: '2.9.9'
 
       - name: Reuse downloaded packages from earlier runs
         uses: actions/cache@v4
         with:
           path: ~\AppData\Local\.xmake\packages
-          key: xmake-packages-${{ github.event.inputs.ue4ss_ref || '1ceefac8' }}
+          key: xmake299-packages-${{ github.event.inputs.ue4ss_ref || '1ceefac8' }}
 
       - name: Set up packages (retries up to 3 times)
         shell: pwsh
         run: |
           $ok = $false
           for ($i = 1; $i -le 3; $i++) {
-            xmake f -m "Game__Shipping__Win64" -y
+            if ($i -lt 3) { xmake f -m "Game__Shipping__Win64" -y }
+            else { xmake f -m "Game__Shipping__Win64" -y -vD }   # last try: print full error details
             if ($LASTEXITCODE -eq 0) { $ok = $true; break }
             Write-Host "::warning::Package setup attempt $i failed, retrying"
           }

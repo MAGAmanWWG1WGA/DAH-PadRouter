@@ -6,6 +6,8 @@
     Install: ue4ss\Mods\DAHPadLink\Scripts\main.lua, then add "DAHPadLink : 1" to Mods\mods.txt
 ]]
 
+local UEHelpers = require("UEHelpers")
+
 local MOD = "DAHPadLink"
 local FILE = "padrouter_handshake.txt"
 
@@ -28,7 +30,7 @@ end
 -- Remove the previous session's handshake so the DLL never reads a stale address.
 os.remove(FILE)
 
-local lastAddress = nil
+local lastWritten = nil
 local keyLines = nil
 local failedOnce = false
 
@@ -48,6 +50,22 @@ local function buildKeyLines()
     return lines
 end
 
+-- Address of player N's PlayerInput object (0 = none). Index 0 = Player 1, 1 = Player 2.
+local function playerInputAddress(index)
+    local ok, addr = pcall(function()
+        local world = UEHelpers.GetWorld()
+        local statics = UEHelpers.GetGameplayStatics()
+        if not (world and world:IsValid() and statics and statics:IsValid()) then return 0 end
+        local pc = statics:GetPlayerController(world, index)
+        if not (pc and pc:IsValid()) then return 0 end
+        local input = pc.PlayerInput
+        if not (input and input:IsValid()) then return 0 end
+        return input:GetAddress()
+    end)
+    if ok and type(addr) == "number" then return addr end
+    return 0
+end
+
 local function writeHandshake()
     local vp = FindFirstOf("GameViewportClient")
     if not vp or not vp:IsValid() then return end
@@ -59,12 +77,20 @@ local function writeHandshake()
         end
         return
     end
-    if address == lastAddress then return end
+    local p1 = playerInputAddress(0)
+    local p2 = playerInputAddress(1)
+
+    local signature = string.format("%X/%X/%X", address, p1, p2)
+    if signature == lastWritten then return end
 
     keyLines = keyLines or buildKeyLines()
     if not keyLines then return end
 
-    local out = { string.format("viewport=0x%X", address) }
+    local out = {
+        string.format("viewport=0x%X", address),
+        string.format("p1input=0x%X", p1),
+        string.format("p2input=0x%X", p2),
+    }
     for _, l in ipairs(keyLines) do out[#out + 1] = l end
     out[#out + 1] = "end"
 
@@ -79,12 +105,11 @@ local function writeHandshake()
     os.remove(FILE)
     os.rename(tmp, FILE)
 
-    lastAddress = address
-    log("Handshake written: viewport 0x%X, %d key IDs (e.g. Gamepad_FaceButton_Bottom = %s)",
-        address, #keyLines, keyLines[11]:match("=(%d+)") or "?")
+    lastWritten = signature
+    log("Handshake written: viewport 0x%X, P1 input 0x%X, P2 input 0x%X, %d key IDs", address, p1, p2, #keyLines)
 end
 
-LoopAsync(2000, function()
+LoopAsync(1000, function()
     ExecuteInGameThread(function()
         local ok, err = pcall(writeHandshake)
         if not ok and not failedOnce then
@@ -92,7 +117,7 @@ LoopAsync(2000, function()
             log("ERROR: %s", tostring(err))
         end
     end)
-    return false  -- keep running (re-sends if the viewport ever changes)
+    return false  -- keep running (re-sends when Player 2 is added/removed or anything changes)
 end)
 
 log("Loaded. Waiting for the game viewport...")

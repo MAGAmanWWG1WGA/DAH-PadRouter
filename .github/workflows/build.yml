@@ -58,8 +58,17 @@ jobs:
           # Unreal headers stop with "Windows Vista and earlier are no longer supported".
           $root = Get-Content RE-UE4SS/xmake.lua -Raw
           $defs = "add_defines(`"WINVER=0x0A00`", `"_WIN32_WINNT=0x0A00`")`n"
+          # Backup for the C++ version, in case a target sets it in a way the edit below misses.
+          $defs += "add_cxxflags(`"/std:c++latest`", {force = true})`n"
+          # Let every target see every UE4SS component's headers (this xmake version doesn't
+          # always pass them between components).
+          Get-ChildItem RE-UE4SS/deps/first -Directory | ForEach-Object {
+            if (Test-Path (Join-Path $_.FullName "include")) {
+              $defs += "add_includedirs(`"deps/first/$($_.Name)/include`")`n"
+            }
+          }
           Set-Content RE-UE4SS/xmake.lua ($defs + $root) -NoNewline
-          Get-Content RE-UE4SS/xmake.lua -TotalCount 3; Get-Content RE-UE4SS/xmake.lua -Tail 3
+          Get-Content RE-UE4SS/xmake.lua -TotalCount 40; Get-Content RE-UE4SS/xmake.lua -Tail 3
           # This xmake version can't ask the current MSVC for C++23, so ask for "latest" instead.
           $changed = 0
           Get-ChildItem RE-UE4SS -Recurse -Include *.lua -File |
@@ -73,6 +82,11 @@ jobs:
               }
             }
           Write-Host "Files changed: $changed"
+          Write-Host "===== How each build file sets the C++ version ====="
+          Get-ChildItem RE-UE4SS -Recurse -Include *.lua -File |
+            Where-Object { $_.FullName -notmatch '\\.git\\' } |
+            Select-String -Pattern 'set_languages|cxxlatest|c\+\+2' |
+            ForEach-Object { Write-Host "$($_.Path.Replace((Resolve-Path RE-UE4SS).Path, '')):$($_.LineNumber): $($_.Line.Trim())" }
           if ($changed -eq 0) { Write-Host "::warning::No C++ version setting found to change" }
 
       - name: Install xmake

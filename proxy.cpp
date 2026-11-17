@@ -91,7 +91,8 @@ struct Config
     // that player's own view (the game measures from there). Re-read while the game runs.
     float AimP1X = 0.25f, AimP2X = 0.25f;   // left/right split
     float AimP1Y0 = 0.0f, AimP2Y0 = 0.0f;   // top/bottom split: added to the half-height aim point
-    int CallSiteLog = 1;           // 1 = log where the game still asks for "the player" (for fixing)
+    int CallSiteLog = 1;
+    int OwnerChain = 1;            // 1 = also follow owner/instigator/outer links to decide whose work it is           // 1 = log where the game still asks for "the player" (for fixing)
     int PlayerContext = 1;         // 1 = the game's code asking for "the player" while working on
                                    //     Player 2's things gets Player 2 (lock-on, aiming, pickups)
 };
@@ -130,6 +131,7 @@ static void LoadConfig()
         else if (key == "AimP1X") { g_Cfg.AimP1X = fv; }
         else if (key == "PlayerContext") { g_Cfg.PlayerContext = int(v); }
         else if (key == "CallSiteLog") { g_Cfg.CallSiteLog = int(v); }
+        else if (key == "OwnerChain") { g_Cfg.OwnerChain = int(v); }
         else if (key == "AimP2X") { g_Cfg.AimP2X = fv; }
         else if (key == "AimP1Y0") { g_Cfg.AimP1Y0 = fv; }
         else if (key == "AimP2Y0") { g_Cfg.AimP2Y0 = fv; }
@@ -949,18 +951,55 @@ static bool InSet(const std::vector<uintptr_t>& v, uintptr_t x)
     return x && std::binary_search(v.begin(), v.end(), x);
 }
 
+// Whose is this object? Checked directly, then through what it belongs to: an actor's Owner
+// and Instigator, a component's owning actor, an object's Outer (e.g. a probe fired by
+// Player 2's gun belongs to the gun, which belongs to Player 2).
+static int ResolveOwner(const PlayerSets* s, uintptr_t obj, int depth)
+{
+    if (!obj || (obj & 7) || obj < 0x10000 || obj > 0x7FFFFFFFFFFFull) { return kCtxUnknown; }
+    if (InSet(s->p2, obj)) { return kCtxP2; }
+    if (InSet(s->p1, obj)) { return kCtxP1; }
+    if (depth <= 0) { return kCtxUnknown; }
+    uintptr_t vt = 0;                                   // only follow things that look like game objects
+    if (!SafeReadPtr(obj, vt) || !g_RData.contains(vt)) { return kCtxUnknown; }
+    static const int kLinks[] = {0x108 /*Owner*/, 0x140 /*Instigator*/, 0x118 /*component owner*/, 0x20 /*Outer*/};
+    for (int off : kLinks)
+    {
+        uintptr_t next = 0;
+        if (SafeReadPtr(obj + off, next) && next && next != obj)
+        {
+            const int r = ResolveOwner(s, next, depth - 1);
+            if (r != kCtxUnknown) { return r; }
+        }
+    }
+    return kCtxUnknown;
+}
+
+static int Classify(const PlayerSets* s, const uintptr_t* regs)
+{
+    for (int i = 0; i < 8; ++i)
+    {
+        if (InSet(s->p2, regs[i])) { return kCtxP2; }
+        if (InSet(s->p1, regs[i])) { return kCtxP1; }
+    }
+    if (g_Cfg.OwnerChain)
+    {
+        for (int i = 0; i < 8; ++i)
+        {
+            const int r = ResolveOwner(s, regs[i], 2);
+            if (r != kCtxUnknown) { return r; }
+        }
+    }
+    return kCtxUnknown;
+}
+
 // regs: rbx, rdi, rsi, r14, r15, r12, r13, rbp (in that order: most likely "this" first)
 static void* FirstPCHook(uint8_t* world, const uintptr_t* regs, uintptr_t ret)
 {
     const PlayerSets* s = g_Sets.load(std::memory_order_acquire);
     if (s && s->p2pc && g_Cfg.PlayerContext && ret >= g_BfgBegin && ret < g_BfgEnd)
     {
-        int outcome = kCtxUnknown;
-        for (int i = 0; i < 8; ++i)
-        {
-            if (InSet(s->p2, regs[i])) { outcome = kCtxP2; break; }
-            if (InSet(s->p1, regs[i])) { outcome = kCtxP1; break; }
-        }
+        const int outcome = Classify(s, regs);
         CountSite(ret, outcome, 1);
         if (outcome == kCtxP2) { g_CtxP2Hits.fetch_add(1, std::memory_order_relaxed); return reinterpret_cast<void*>(s->p2pc); }
     }
@@ -977,12 +1016,7 @@ static void* FirstLocalPCHook(void* gameInstance, const uintptr_t* regs, uintptr
     const PlayerSets* s = g_Sets.load(std::memory_order_acquire);
     if (s && s->p2pc && g_Cfg.PlayerContext && ret >= g_BfgBegin && ret < g_BfgEnd)
     {
-        int outcome = kCtxUnknown;
-        for (int i = 0; i < 8; ++i)
-        {
-            if (InSet(s->p2, regs[i])) { outcome = kCtxP2; break; }
-            if (InSet(s->p1, regs[i])) { outcome = kCtxP1; break; }
-        }
+        const int outcome = Classify(s, regs);
         CountSite(ret, outcome, 2);
         if (outcome == kCtxP2) { g_CtxP2Hits.fetch_add(1, std::memory_order_relaxed); return reinterpret_cast<void*>(s->p2pc); }
     }

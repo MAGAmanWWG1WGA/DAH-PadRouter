@@ -6,6 +6,9 @@ on:
       ue4ss_ref:
         description: "RE-UE4SS commit or tag to build against (must match the UE4SS in the game)"
         default: "1ceefac8"
+      xmake_version:
+        description: "xmake version to use"
+        default: "3.0.1"
   push:
     paths:
       - "DAHPadRouter/**"
@@ -58,47 +61,24 @@ jobs:
           # Unreal headers stop with "Windows Vista and earlier are no longer supported".
           $root = Get-Content RE-UE4SS/xmake.lua -Raw
           $defs = "add_defines(`"WINVER=0x0A00`", `"_WIN32_WINNT=0x0A00`")`n"
-          # Backup for the C++ version, in case a target sets it in a way the edit below misses.
-          $defs += "add_cxxflags(`"/std:c++latest`", {force = true})`n"
-          # Let every target see every UE4SS component's headers (this xmake version doesn't
-          # always pass them between components).
-          Get-ChildItem RE-UE4SS/deps/first -Directory | ForEach-Object {
-            if (Test-Path (Join-Path $_.FullName "include")) {
-              $defs += "add_includedirs(`"deps/first/$($_.Name)/include`")`n"
-            }
-          }
           Set-Content RE-UE4SS/xmake.lua ($defs + $root) -NoNewline
-          Get-Content RE-UE4SS/xmake.lua -TotalCount 40; Get-Content RE-UE4SS/xmake.lua -Tail 3
-          # This xmake version can't ask the current MSVC for C++23, so ask for "latest" instead.
-          $changed = 0
-          Get-ChildItem RE-UE4SS -Recurse -Include *.lua -File |
-            Where-Object { $_.FullName -notmatch '\\.git\\' } |
-            ForEach-Object {
-              $text = Get-Content $_.FullName -Raw
-              if ($text -match '"(cxx|c\+\+)2[03]"') {
-                ($text -replace '"(cxx|c\+\+)2[03]"', '"cxxlatest"') | Set-Content $_.FullName -NoNewline
-                Write-Host "C++ version set to latest in $($_.FullName)"
-                $changed++
-              }
-            }
-          Write-Host "Files changed: $changed"
+          Get-Content RE-UE4SS/xmake.lua -TotalCount 3; Get-Content RE-UE4SS/xmake.lua -Tail 3
           Write-Host "===== How each build file sets the C++ version ====="
           Get-ChildItem RE-UE4SS -Recurse -Include *.lua -File |
             Where-Object { $_.FullName -notmatch '\\.git\\' } |
             Select-String -Pattern 'set_languages|cxxlatest|c\+\+2' |
             ForEach-Object { Write-Host "$($_.Path.Replace((Resolve-Path RE-UE4SS).Path, '')):$($_.LineNumber): $($_.Line.Trim())" }
-          if ($changed -eq 0) { Write-Host "::warning::No C++ version setting found to change" }
 
       - name: Install xmake
         uses: xmake-io/github-action-setup-xmake@v1
         with:
-          xmake-version: '2.9.9'
+          xmake-version: ${{ github.event.inputs.xmake_version || '3.0.1' }}
 
       - name: Reuse downloaded packages from earlier runs
         uses: actions/cache@v4
         with:
           path: ~\AppData\Local\.xmake\packages
-          key: xmake299-packages-${{ github.event.inputs.ue4ss_ref || '1ceefac8' }}
+          key: xmake-${{ github.event.inputs.xmake_version || '3.0.1' }}-packages-${{ github.event.inputs.ue4ss_ref || '1ceefac8' }}
 
       - name: Set up packages (retries up to 3 times)
         shell: pwsh

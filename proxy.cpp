@@ -1384,9 +1384,13 @@ static void InstallScriptContext()
     {
         std::memcpy(&target, b + 6, 8); span = 14;
     }
-    else if (b[0] == 0x40 && b[1] == 0x55)
+    else if (b[0] == 0x40 && b[1] == 0x55 && b[2] == 0x56 && b[3] == 0x57 && b[4] == 0x41 && b[5] == 0x54)
     {
-        return; // UE4SS hasn't hooked it yet: try again later
+        // nothing has hooked it (this UE4SS doesn't): after a short wait, hook the original.
+        static ULONGLONG firstSeen = 0;
+        if (!firstSeen) { firstSeen = GetTickCount64(); }
+        if (GetTickCount64() - firstSeen < 20000) { return; }
+        span = 6;   // push rbp / push rsi / push rdi / push r12: copied into the trampoline
     }
     else
     {
@@ -1397,20 +1401,32 @@ static void InstallScriptContext()
     g_ScriptCtxDone = true;
     uint8_t* mem = AllocNear(pe);
     if (!mem) { Log("Script context: no memory near the game code"); return; }
-    // trampoline = "the original" = UE4SS's hook target
     uint8_t jmp[14] = {0xFF, 0x25, 0, 0, 0, 0};
-    std::memcpy(jmp + 6, &target, 8);
-    std::memcpy(mem, jmp, 14);
+    if (span == 6)
+    {
+        // trampoline = the 6 original bytes, then back into ProcessEvent after them
+        std::memcpy(mem, b, 6);
+        const uintptr_t back = pe + 6;
+        std::memcpy(jmp + 6, &back, 8);
+        std::memcpy(mem + 6, jmp, 14);
+        span = 5;   // patched with a 5-byte jump below
+    }
+    else
+    {
+        // trampoline = "the original" = UE4SS's hook target
+        std::memcpy(jmp + 6, &target, 8);
+        std::memcpy(mem, jmp, 14);
+    }
     // relay to our hook
     const uintptr_t hook = reinterpret_cast<uintptr_t>(&ProcessEventHook);
     std::memcpy(jmp + 6, &hook, 8);
-    std::memcpy(mem + 16, jmp, 14);
+    std::memcpy(mem + 32, jmp, 14);
     FlushInstructionCache(GetCurrentProcess(), mem, 64);
     g_PEOrig = reinterpret_cast<ProcessEventFn>(mem);
     bool ok = false;
     if (span == 5)
     {
-        const int64_t rel = int64_t(reinterpret_cast<uintptr_t>(mem + 16)) - int64_t(pe + 5);
+        const int64_t rel = int64_t(reinterpret_cast<uintptr_t>(mem + 32)) - int64_t(pe + 5);
         if (rel > INT32_MIN && rel < INT32_MAX)
         {
             DWORD old = 0;
@@ -1431,9 +1447,9 @@ static void InstallScriptContext()
     }
     else
     {
-        ok = JumpTo(pe, reinterpret_cast<uintptr_t>(mem + 16));
+        ok = JumpTo(pe, reinterpret_cast<uintptr_t>(mem + 32));
     }
-    Log("Script context: ProcessEvent %p %s (on top of UE4SS's hook)", (void*)pe, ok ? "hooked" : "FAILED");
+    Log("Script context: ProcessEvent %p %s", (void*)pe, ok ? "hooked" : "FAILED");
     if (!ok) { g_PEOrig = nullptr; }
 }
 

@@ -24,6 +24,7 @@
 #include <intrin.h>
 
 #include <algorithm>
+#include <cmath>
 #include <array>
 #include <atomic>
 #include <cstdarg>
@@ -799,6 +800,7 @@ static uintptr_t* g_GEnginePtr = nullptr;      // address of the GEngine global
 static int32_t g_OffGameViewport = 0, g_OffViewport = 0, g_OffAltFlag = 0, g_OffAltOffset = 0, g_OffOffset = 0;
 static std::atomic<bool> g_AimFixOn{false};
 static std::atomic<long> g_AimCalls{0};
+static std::atomic<long> g_AimOverrides{0};
 
 static FVec2* AimCrosshairHook(uint8_t* tc, FVec2* out)
 {
@@ -822,6 +824,41 @@ static FVec2* AimCrosshairHook(uint8_t* tc, FVec2* out)
     const uintptr_t self = reinterpret_cast<uintptr_t>(tc);
     const uintptr_t p1 = g_P1Target.load(std::memory_order_relaxed);
     const uintptr_t p2 = g_P2Target.load(std::memory_order_relaxed);
+    // Aim-point override from the Lua mod (e.g. Player 2's PK reaching for its yellow-arc
+    // target without turning the camera). The Lua mod writes a coded value into this
+    // component's crosshair height: 100 + X + Y/1000, X and Y being 0..999 across the
+    // player's own view. Normal heights are small (about -1..1), so they never look like this.
+    if (p2 && (self == p1 || self == p2))
+    {
+        const float a = *reinterpret_cast<float*>(tc + g_OffOffset);
+        const float b = *reinterpret_cast<float*>(tc + g_OffAltOffset);
+        const float code = a >= 99.5f ? a : (b >= 99.5f ? b : 0.0f);
+        if (code >= 99.5f && code < 1100.5f)
+        {
+            const float v = code - 100.0f;
+            const float xq = std::floor(v + 0.0005f);
+            const float yq = std::floor((v - xq) * 1000.0f + 0.5f);
+            const float fx = std::clamp(xq / 999.0f, 0.0f, 1.0f), fy = std::clamp(yq / 999.0f, 0.0f, 1.0f);
+            const bool second = self == p2;
+            if (g_LayoutVertical.load(std::memory_order_relaxed))
+            {
+                x = w * 0.5f * (fx + (second ? 1.0f : 0.0f));
+                y = h * fy;
+            }
+            else
+            {
+                x = w * fx;
+                y = h * 0.5f * (fy + (second ? 1.0f : 0.0f));
+            }
+            if (g_AimOverrides.fetch_add(1, std::memory_order_relaxed) == 0)
+            {
+                Log("Aim override from the Lua mod: player %d aims at (%.0f, %.0f)", second ? 2 : 1, x, y);
+            }
+            out->X = x;
+            out->Y = y;
+            return out;
+        }
+    }
     if (p2 && (self == p1 || self == p2))
     {
         const bool second = self == p2;
@@ -900,6 +937,7 @@ static void InstallAimFix()
     g_AimFn = found;
     Log("Aim fix: installed at %p (GEngine %p, offsets %X/%X/%X/%X/%X)", (void*)found, (void*)g_GEnginePtr,
         g_OffGameViewport, g_OffViewport, g_OffAltFlag, g_OffAltOffset, g_OffOffset);
+    Log("Aim override channel: ready (the Lua mod can move a player's aim point)");
 }
 
 // ============================================================================

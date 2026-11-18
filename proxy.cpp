@@ -93,6 +93,8 @@ struct Config
     float AimP1Y0 = 0.0f, AimP2Y0 = 0.0f;   // top/bottom split: added to the half-height aim point
     int CallSiteLog = 1;
     int OwnerChain = 1;            // 1 = also follow owner/instigator/outer links to decide whose work it is           // 1 = log where the game still asks for "the player" (for fixing)
+    int ScriptContext = 1;         // 1 = also look at which object's event/script is running right now
+                                   //     (ProcessEvent) to decide whose work it is
     int StaticsContext = 1;        // 1 = Blueprint "Get Player Controller/Pawn/Character (0)" asked by
                                    //     Player 2's things (effects, abilities) gets Player 2
     int PlayerContext = 1;         // 1 = the game's code asking for "the player" while working on
@@ -135,6 +137,7 @@ static void LoadConfig()
         else if (key == "CallSiteLog") { g_Cfg.CallSiteLog = int(v); }
         else if (key == "OwnerChain") { g_Cfg.OwnerChain = int(v); }
         else if (key == "StaticsContext") { g_Cfg.StaticsContext = int(v); }
+        else if (key == "ScriptContext") { g_Cfg.ScriptContext = int(v); }
         else if (key == "AimP2X") { g_Cfg.AimP2X = fv; }
         else if (key == "AimP1Y0") { g_Cfg.AimP1Y0 = fv; }
         else if (key == "AimP2Y0") { g_Cfg.AimP2Y0 = fv; }
@@ -978,6 +981,35 @@ static int ResolveOwner(const PlayerSets* s, uintptr_t obj, int depth)
     return kCtxUnknown;
 }
 
+// ---- Script context ------------------------------------------------------------------
+// UObject::ProcessEvent runs every Blueprint event and script call (ticks, weapon fire, ability
+// events). Each thread keeps a small stack of the objects whose events are running, so when the
+// game asks "who is the player?" with nothing in the registers to tell, the object whose event is
+// running (Player 2's weapon, ability, pawn...) decides it.
+static thread_local uintptr_t t_PeStack[32];
+static thread_local int t_PeDepth = 0;
+using ProcessEventFn = void (*)(void* obj, void* fn, void* parms);
+static ProcessEventFn g_PEOrig = nullptr;
+static void ProcessEventHook(void* obj, void* fn, void* parms)
+{
+    const int d = t_PeDepth;
+    if (d < 32) { t_PeStack[d] = reinterpret_cast<uintptr_t>(obj); }
+    t_PeDepth = d + 1;
+    g_PEOrig(obj, fn, parms);
+    t_PeDepth = d;
+}
+static int ClassifyByScript(const PlayerSets* s)
+{
+    if (!g_Cfg.ScriptContext || !g_PEOrig) { return kCtxUnknown; }
+    const int top = t_PeDepth < 32 ? t_PeDepth : 32;
+    for (int i = top - 1, n = 0; i >= 0 && n < 6; --i, ++n)
+    {
+        const int r = ResolveOwner(s, t_PeStack[i], 2);
+        if (r != kCtxUnknown) { return r; }
+    }
+    return kCtxUnknown;
+}
+
 static int Classify(const PlayerSets* s, const uintptr_t* regs)
 {
     for (int i = 0; i < 8; ++i)
@@ -993,7 +1025,7 @@ static int Classify(const PlayerSets* s, const uintptr_t* regs)
             if (r != kCtxUnknown) { return r; }
         }
     }
-    return kCtxUnknown;
+    return ClassifyByScript(s);
 }
 
 // regs: rbx, rdi, rsi, r14, r15, r12, r13, rbp (in that order: most likely "this" first)
@@ -1045,7 +1077,8 @@ static void* StaticsPCHook(void* ctx, int index)
 #else
             const uintptr_t ret = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
 #endif
-            const int outcome = ResolveOwner(s, reinterpret_cast<uintptr_t>(ctx), 3);
+            int outcome = ResolveOwner(s, reinterpret_cast<uintptr_t>(ctx), 3);
+            if (outcome == kCtxUnknown) { outcome = ClassifyByScript(s); }
             CountSite(ret, outcome, 3);
             if (outcome == kCtxP2) { g_CtxP2Hits.fetch_add(1, std::memory_order_relaxed); return reinterpret_cast<void*>(s->p2pc); }
         }
@@ -1310,6 +1343,100 @@ static void InstallPlayerContext(uintptr_t aimFn)
         ok ? "installed" : "FAILED", (void*)gfpc, (void*)project, (void*)deproject, (void*)g_BfgBegin, (void*)g_BfgEnd);
 }
 
+// Memory within +-2 GB of the game code, for a 5-byte jump.
+static uint8_t* AllocNear(uintptr_t near)
+{
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    const uintptr_t gran = si.dwAllocationGranularity;
+    for (uintptr_t off = 0x100000; off < 0x70000000; off += gran)
+    {
+        for (int sign = -1; sign <= 1; sign += 2)
+        {
+            const uintptr_t at = ((sign < 0 ? near - off : near + off) / gran) * gran;
+            void* p = VirtualAlloc(reinterpret_cast<void*>(at), 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+            if (p) { return static_cast<uint8_t*>(p); }
+        }
+    }
+    return nullptr;
+}
+
+// Hook ProcessEvent on top of UE4SS's own hook (UE4SS hooks it first; its jump at the start is
+// kept as "the original"). Only installed once UE4SS's jump is there.
+static bool g_ScriptCtxDone = false;
+static void InstallScriptContext()
+{
+    if (g_ScriptCtxDone || !g_Cfg.ScriptContext) { return; }
+    const uintptr_t body = FindUnique(
+        "48 81 EC F0 00 00 00 48 8D 6C 24 30 48 89 9D 18 01 00 00 48 8B 05 ?? ?? ?? ?? 48 33 C5 48 89 85 B0 00 00 00 8B 41 0C",
+        "ProcessEvent");
+    if (!body) { g_ScriptCtxDone = true; return; }
+    const uintptr_t pe = body - 12;
+    const uint8_t* b = reinterpret_cast<const uint8_t*>(pe);
+    uintptr_t target = 0;
+    size_t span = 0;
+    if (b[0] == 0xE9)
+    {
+        int32_t rel; std::memcpy(&rel, b + 1, 4);
+        target = pe + 5 + rel; span = 5;
+    }
+    else if (b[0] == 0xFF && b[1] == 0x25 && b[2] == 0 && b[3] == 0 && b[4] == 0 && b[5] == 0)
+    {
+        std::memcpy(&target, b + 6, 8); span = 14;
+    }
+    else if (b[0] == 0x40 && b[1] == 0x55)
+    {
+        return; // UE4SS hasn't hooked it yet: try again later
+    }
+    else
+    {
+        Log("Script context: ProcessEvent starts with unexpected bytes %02X %02X %02X; not hooked", b[0], b[1], b[2]);
+        g_ScriptCtxDone = true;
+        return;
+    }
+    g_ScriptCtxDone = true;
+    uint8_t* mem = AllocNear(pe);
+    if (!mem) { Log("Script context: no memory near the game code"); return; }
+    // trampoline = "the original" = UE4SS's hook target
+    uint8_t jmp[14] = {0xFF, 0x25, 0, 0, 0, 0};
+    std::memcpy(jmp + 6, &target, 8);
+    std::memcpy(mem, jmp, 14);
+    // relay to our hook
+    const uintptr_t hook = reinterpret_cast<uintptr_t>(&ProcessEventHook);
+    std::memcpy(jmp + 6, &hook, 8);
+    std::memcpy(mem + 16, jmp, 14);
+    FlushInstructionCache(GetCurrentProcess(), mem, 64);
+    g_PEOrig = reinterpret_cast<ProcessEventFn>(mem);
+    bool ok = false;
+    if (span == 5)
+    {
+        const int64_t rel = int64_t(reinterpret_cast<uintptr_t>(mem + 16)) - int64_t(pe + 5);
+        if (rel > INT32_MIN && rel < INT32_MAX)
+        {
+            DWORD old = 0;
+            if (VirtualProtect(reinterpret_cast<void*>(pe), 8, PAGE_EXECUTE_READWRITE, &old))
+            {
+                uint64_t cur; std::memcpy(&cur, b, 8);
+                uint64_t nv = cur;
+                uint8_t* nb = reinterpret_cast<uint8_t*>(&nv);
+                nb[0] = 0xE9;
+                const int32_t r32 = int32_t(rel);
+                std::memcpy(nb + 1, &r32, 4);
+                InterlockedExchange64(reinterpret_cast<volatile LONG64*>(pe), LONG64(nv));  // one atomic write
+                VirtualProtect(reinterpret_cast<void*>(pe), 8, old, &old);
+                FlushInstructionCache(GetCurrentProcess(), reinterpret_cast<void*>(pe), 8);
+                ok = true;
+            }
+        }
+    }
+    else
+    {
+        ok = JumpTo(pe, reinterpret_cast<uintptr_t>(mem + 16));
+    }
+    Log("Script context: ProcessEvent %p %s (on top of UE4SS's hook)", (void*)pe, ok ? "hooked" : "FAILED");
+    if (!ok) { g_PEOrig = nullptr; }
+}
+
 static FILETIME g_HandshakeTime{};
 static uintptr_t g_HandshakeViewport = 0;
 
@@ -1347,6 +1474,7 @@ static void ApplyHandshake()
 {
     std::vector<std::string> lines;
     if (!ReadHandshake(lines)) { return; }
+    InstallScriptContext();
 
     uintptr_t viewport = 0;
     uintptr_t p1input = 0, p2input = 0;

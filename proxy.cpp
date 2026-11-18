@@ -102,6 +102,35 @@ struct Config
 };
 static Config g_Cfg;
 
+// ForceP1Sites=0xA7E994,0x960E52 : call sites (exe offsets from the call-site log) that always
+// get Player 1 - for finding which "who is the player?" question is behind a co-op bug.
+static std::atomic<uintptr_t> g_ForceP1[64];
+static std::atomic<int> g_ForceP1Count{0};
+static void ParseSiteList(const char* text)
+{
+    int n = 0;
+    const uintptr_t base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    const char* p = text;
+    while (*p && n < 64)
+    {
+        while (*p == ' ' || *p == ',' || *p == '\t') { ++p; }
+        if (!*p || *p == '\r' || *p == '\n' || *p == '#') { break; }
+        char* end = nullptr;
+        const unsigned long long off = std::strtoull(p, &end, 0);
+        if (end == p) { break; }
+        if (off) { g_ForceP1[n++].store(base + uintptr_t(off)); }
+        p = end;
+    }
+    g_ForceP1Count.store(n);
+    Log("ForceP1Sites: %d place(s) always get Player 1", n);
+}
+static bool IsForcedP1(uintptr_t ret)
+{
+    const int n = g_ForceP1Count.load(std::memory_order_relaxed);
+    for (int i = 0; i < n; ++i) { if (g_ForceP1[i].load(std::memory_order_relaxed) == ret) { return true; } }
+    return false;
+}
+
 static void LoadConfig()
 {
     FILE* f = _wfopen((g_ExeDir + L"\\DAHPadRouter.ini").c_str(), L"r");
@@ -110,7 +139,8 @@ static void LoadConfig()
         Log("DAHPadRouter.ini not found next to the game exe, using defaults");
         return;
     }
-    char line[256];
+    g_ForceP1Count.store(0);
+    char line[512];
     while (std::fgets(line, sizeof(line), f))
     {
         if (line[0] == '#' || line[0] == ';') { continue; }
@@ -136,6 +166,7 @@ static void LoadConfig()
         else if (key == "PlayerContext") { g_Cfg.PlayerContext = int(v); }
         else if (key == "CallSiteLog") { g_Cfg.CallSiteLog = int(v); }
         else if (key == "OwnerChain") { g_Cfg.OwnerChain = int(v); }
+        else if (key == "ForceP1Sites") { ParseSiteList(eq + 1); }
         else if (key == "StaticsContext") { g_Cfg.StaticsContext = int(v); }
         else if (key == "ScriptContext") { g_Cfg.ScriptContext = int(v); }
         else if (key == "AimP2X") { g_Cfg.AimP2X = fv; }
@@ -1034,7 +1065,7 @@ static void* FirstPCHook(uint8_t* world, const uintptr_t* regs, uintptr_t ret)
     const PlayerSets* s = g_Sets.load(std::memory_order_acquire);
     if (s && s->p2pc && g_Cfg.PlayerContext && ret >= g_BfgBegin && ret < g_BfgEnd)
     {
-        const int outcome = Classify(s, regs);
+        const int outcome = IsForcedP1(ret) ? kCtxP1 : Classify(s, regs);
         CountSite(ret, outcome, 1);
         if (outcome == kCtxP2) { g_CtxP2Hits.fetch_add(1, std::memory_order_relaxed); return reinterpret_cast<void*>(s->p2pc); }
     }
@@ -1051,7 +1082,7 @@ static void* FirstLocalPCHook(void* gameInstance, const uintptr_t* regs, uintptr
     const PlayerSets* s = g_Sets.load(std::memory_order_acquire);
     if (s && s->p2pc && g_Cfg.PlayerContext && ret >= g_BfgBegin && ret < g_BfgEnd)
     {
-        const int outcome = Classify(s, regs);
+        const int outcome = IsForcedP1(ret) ? kCtxP1 : Classify(s, regs);
         CountSite(ret, outcome, 2);
         if (outcome == kCtxP2) { g_CtxP2Hits.fetch_add(1, std::memory_order_relaxed); return reinterpret_cast<void*>(s->p2pc); }
     }
@@ -1077,7 +1108,7 @@ static void* StaticsPCHook(void* ctx, int index)
 #else
             const uintptr_t ret = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
 #endif
-            int outcome = ResolveOwner(s, reinterpret_cast<uintptr_t>(ctx), 3);
+            int outcome = IsForcedP1(ret) ? kCtxP1 : ResolveOwner(s, reinterpret_cast<uintptr_t>(ctx), 3);
             if (outcome == kCtxUnknown) { outcome = ClassifyByScript(s); }
             CountSite(ret, outcome, 3);
             if (outcome == kCtxP2) { g_CtxP2Hits.fetch_add(1, std::memory_order_relaxed); return reinterpret_cast<void*>(s->p2pc); }

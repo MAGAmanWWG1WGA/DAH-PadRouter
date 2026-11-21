@@ -398,6 +398,8 @@ static std::atomic<uintptr_t> g_InputVTable{0};
 static std::atomic<PIKeyFn> g_PIKey{nullptr};
 static std::atomic<PIAxisFn> g_PIAxis{nullptr};
 static std::atomic<bool> g_ResetPad{false};
+static std::atomic<uintptr_t> g_P3Input{0};   // Players 3 and 4 (groundwork): their PlayerInput,
+static std::atomic<uintptr_t> g_P4Input{0};   // from the handshake (0 = not in the game)
 static std::atomic<int> g_SkinRequest{0};          // Select + D-pad left/right on pad 2: -1 / +1 (skin change)
 static std::atomic<ULONGLONG> g_IgnoreP2Until{0};  // after a drop-out: don't take Player 2's input address from the handshake
 static std::atomic<bool> g_DropRequested{false};   // Start held 2 s on pad 2 while Player 2 exists
@@ -677,6 +679,18 @@ extern "C" DWORD WINAPI Proxy_XInputGetState(DWORD userIndex, XINPUT_STATE* stat
     DWORD result = g_Real.GetState(userIndex, state);
     void* const caller = _ReturnAddress();
     MonitorPad(userIndex, result, state, caller);
+    // Players 3 and 4 with no pad of their own: their slot looks connected but idle, or the game
+    // hands them Player 1's input. (A real pad there is passed through as it is, for now.)
+    if ((userIndex == 2 && g_P3Input.load()) || (userIndex == 3 && g_P4Input.load()))
+    {
+        if (result != ERROR_SUCCESS && state)
+        {
+            ZeroMemory(state, sizeof(XINPUT_STATE));
+            state->dwPacketNumber = 1;
+            return ERROR_SUCCESS;
+        }
+        return result;
+    }
     if (int(userIndex) != g_Cfg.HidePadIndex) { return result; }
 
     if (!g_Enabled)
@@ -749,6 +763,12 @@ extern "C" DWORD WINAPI Proxy_XInputGetStateEx(DWORD userIndex, XINPUT_STATE* st
     LoadRealXInput();
     if (!g_Real.GetStateEx) { return Proxy_XInputGetState(userIndex, state); }
     DWORD result = g_Real.GetStateEx(userIndex, state);
+    if (((userIndex == 2 && g_P3Input.load()) || (userIndex == 3 && g_P4Input.load())) && result != ERROR_SUCCESS && state)
+    {
+        ZeroMemory(state, sizeof(XINPUT_STATE));
+        state->dwPacketNumber = 1;
+        return ERROR_SUCCESS;
+    }
     if (int(userIndex) == g_Cfg.HidePadIndex && g_Enabled && result == ERROR_SUCCESS && state)
     {
         state->Gamepad = XINPUT_GAMEPAD{};
@@ -1623,6 +1643,14 @@ static void ApplyHandshake()
         else if (line.rfind("p2input=", 0) == 0)
         {
             p2input = static_cast<uintptr_t>(std::strtoull(line.c_str() + 8, nullptr, 0));
+        }
+        else if (line.rfind("p3input=", 0) == 0)
+        {
+            g_P3Input = static_cast<uintptr_t>(std::strtoull(line.c_str() + 8, nullptr, 0));
+        }
+        else if (line.rfind("p4input=", 0) == 0)
+        {
+            g_P4Input = static_cast<uintptr_t>(std::strtoull(line.c_str() + 8, nullptr, 0));
         }
         else if (line.rfind("p1target=", 0) == 0)
         {

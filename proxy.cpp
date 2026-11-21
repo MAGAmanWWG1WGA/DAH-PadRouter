@@ -86,6 +86,7 @@ struct Config
     bool Enabled = true;
     int HidePadIndex = 1;          // XInput slot of Player 2's pad (0 = first pad)
     int P2ControllerId = 1;        // Unreal ControllerId of Player 2 (DAH2P creates it with 1)
+    bool RouteExtraPads = true;    // pads 3 and 4 drive Players 3 and 4 (their PlayerInput from the handshake)
     int InputKeySlot = 0;          // found by the probe; 0 = not set (pad is only hidden)
     int InputAxisSlot = 0;         // found by the probe
     int ViewportClientOffset = 0;  // 0 = auto-detect the FViewportClient part of the viewport object
@@ -161,6 +162,7 @@ static void LoadConfig()
         if (key == "Enabled") { g_Cfg.Enabled = v != 0; }
         else if (key == "HidePadIndex") { g_Cfg.HidePadIndex = int(v); }
         else if (key == "P2ControllerId") { g_Cfg.P2ControllerId = int(v); }
+        else if (key == "RouteExtraPads") { g_Cfg.RouteExtraPads = v != 0; }
         else if (key == "InputKeySlot") { g_Cfg.InputKeySlot = int(v); }
         else if (key == "InputAxisSlot") { g_Cfg.InputAxisSlot = int(v); }
         else if (key == "ViewportClientOffset") { g_Cfg.ViewportClientOffset = int(v); }
@@ -555,6 +557,72 @@ static void SendAxis(int index, float value, float dt)
     fn(self, reinterpret_cast<void*>(viewport), g_Cfg.P2ControllerId, &key, value, dt, 1, true);
 }
 
+// Players 3 and 4: the same direct PlayerInput route as Player 2 (Mode 1), into their own input
+static void SendKeyTo(uintptr_t input, int index, bool pressed)
+{
+    auto fn = g_PIKey.load();
+    if (!fn || !PlayerInputValid(input)) { return; }
+    FKeyRaw key{};
+    key.Name = g_ButtonFNames[index];
+    fn(reinterpret_cast<void*>(input), &key, pressed ? 0 : 1, 1.0f, true);
+}
+static void SendAxisTo(uintptr_t input, int index, float value, float dt)
+{
+    if (!PlayerInputValid(input)) { return; }
+    FKeyRaw key{};
+    key.Name = g_AxisFNames[index];
+    if (auto axisFn = g_PIAxis.load()) { axisFn(reinterpret_cast<void*>(input), &key, value, dt, 1, true); }
+    else if (auto keyFn = g_PIKey.load()) { keyFn(reinterpret_cast<void*>(input), &key, value != 0.0f ? 0 : 1, value, true); }
+}
+struct ExtraRoute
+{
+    std::array<bool, BK_Count> prevB{};
+    std::array<float, AK_Count> prevA{};
+    LARGE_INTEGER last{};
+    uintptr_t input = 0;     // the input these held buttons were sent to
+    bool logged = false;
+    bool selLeft = false, selRight = false;
+};
+static ExtraRoute g_Extra[2];                        // [0] = Player 3 (pad slot 2), [1] = Player 4 (pad slot 3)
+static std::atomic<int> g_SkinRequestX[2] = {0, 0};  // Select + D-pad on pads 3 / 4
+
+static void RouteExtraPad(int which, uintptr_t input, const XINPUT_GAMEPAD* pad)
+{
+    ExtraRoute& r = g_Extra[which];
+    if (r.input != input) { r.prevB = {}; r.prevA = {}; r.input = input; }   // new player: nothing held
+    std::array<bool, BK_Count> buttons{};
+    std::array<float, AK_Count> axes{};
+    if (pad)
+    {
+        XINPUT_GAMEPAD g = *pad;
+        if (g.wButtons & XINPUT_GAMEPAD_BACK)
+        {
+            // Select + D-pad left/right: that player's skin; the D-pad doesn't reach the game
+            const bool l = (g.wButtons & XINPUT_GAMEPAD_DPAD_LEFT) != 0;
+            const bool rr = (g.wButtons & XINPUT_GAMEPAD_DPAD_RIGHT) != 0;
+            if (l && !r.selLeft) { g_SkinRequestX[which] = -1; }
+            if (rr && !r.selRight) { g_SkinRequestX[which] = 1; }
+            r.selLeft = l; r.selRight = rr;
+            g.wButtons &= ~WORD(XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_DOWN | XINPUT_GAMEPAD_DPAD_LEFT | XINPUT_GAMEPAD_DPAD_RIGHT);
+        }
+        else { r.selLeft = r.selRight = false; }
+        ComputeButtons(g, buttons);
+        ComputeAxes(g, axes);
+        buttons[BK_Start] = false;   // only Player 1 pauses the game
+    }
+    LARGE_INTEGER now{}, freq{};
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&freq);
+    float dt = r.last.QuadPart ? float(double(now.QuadPart - r.last.QuadPart) / double(freq.QuadPart)) : 0.016f;
+    if (dt <= 0.0f || dt > 0.25f) { dt = 0.016f; }
+    r.last = now;
+    for (int i = 0; i < BK_Count; ++i) { if (buttons[i] != r.prevB[i]) { SendKeyTo(input, i, buttons[i]); } }
+    for (int i = 0; i < AK_Count; ++i) { if (axes[i] != r.prevA[i]) { SendAxisTo(input, i, axes[i], dt); } }
+    r.prevB = buttons;
+    r.prevA = axes;
+    if (pad && !r.logged) { r.logged = true; Log("Routing pad %d to Player %d's input (first frame sent)", which + 2, which + 3); }
+}
+
 static bool InjectionReady()
 {
     if (g_Probing || !g_NamesReady) { return false; }
@@ -683,13 +751,23 @@ extern "C" DWORD WINAPI Proxy_XInputGetState(DWORD userIndex, XINPUT_STATE* stat
     // hands them Player 1's input. (A real pad there is passed through as it is, for now.)
     if ((userIndex == 2 && g_P3Input.load()) || (userIndex == 3 && g_P4Input.load()))
     {
-        if (result != ERROR_SUCCESS && state)
+        const int which = int(userIndex) - 2;
+        const uintptr_t input = which == 0 ? g_P3Input.load() : g_P4Input.load();
+        const bool connected = result == ERROR_SUCCESS && state;
+        XINPUT_GAMEPAD pad{};
+        if (connected) { pad = state->Gamepad; }
+        if (state)
         {
+            // the game sees a connected pad that is never touched; the real buttons go to
+            // that player's own input below (so they can't drive Player 1)
             ZeroMemory(state, sizeof(XINPUT_STATE));
             state->dwPacketNumber = 1;
-            return ERROR_SUCCESS;
         }
-        return result;
+        if (g_Cfg.RouteExtraPads && CalledByGame(caller) && g_NamesReady && !g_Probing && g_PIKey.load() && PlayerInputValid(input))
+        {
+            RouteExtraPad(which, input, connected ? &pad : nullptr);
+        }
+        return state ? ERROR_SUCCESS : result;
     }
     if (int(userIndex) != g_Cfg.HidePadIndex) { return result; }
 
@@ -763,7 +841,7 @@ extern "C" DWORD WINAPI Proxy_XInputGetStateEx(DWORD userIndex, XINPUT_STATE* st
     LoadRealXInput();
     if (!g_Real.GetStateEx) { return Proxy_XInputGetState(userIndex, state); }
     DWORD result = g_Real.GetStateEx(userIndex, state);
-    if (((userIndex == 2 && g_P3Input.load()) || (userIndex == 3 && g_P4Input.load())) && result != ERROR_SUCCESS && state)
+    if (((userIndex == 2 && g_P3Input.load()) || (userIndex == 3 && g_P4Input.load())) && state)
     {
         ZeroMemory(state, sizeof(XINPUT_STATE));
         state->dwPacketNumber = 1;
@@ -2069,6 +2147,22 @@ static DWORD WINAPI Worker(LPVOID)
             for (const auto& path : paths)
             {
                 if (FILE* f = _wfopen(path.c_str(), L"a")) { std::fputs(dir > 0 ? "next\n" : "prev\n", f); std::fclose(f); break; }
+            }
+        }
+        for (int which = 0; which < 2; ++which)
+        {
+            if (const int dir = g_SkinRequestX[which].exchange(0))
+            {
+                const std::wstring paths[] = {L"padrouter_skin_request.txt", g_ExeDir + L"\\ue4ss\\padrouter_skin_request.txt"};
+                for (const auto& path : paths)
+                {
+                    if (FILE* f = _wfopen(path.c_str(), L"a"))
+                    {
+                        std::fprintf(f, "%s%d\n", dir > 0 ? "next" : "prev", which + 3);
+                        std::fclose(f);
+                        break;
+                    }
+                }
             }
         }
 

@@ -25,6 +25,8 @@
 #pragma comment(lib, "winmm.lib")
 #include <objbase.h>
 #pragma comment(lib, "ole32.lib")
+#include <mfplay.h>
+#pragma comment(lib, "mfplay.lib")
 #include <intrin.h>
 
 #include <algorithm>
@@ -2110,21 +2112,15 @@ static std::wstring Utf8ToWide(const std::string& s)
     MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), &w[0], n);
     return w;
 }
-static std::wstring MciStatus()
-{
-    wchar_t buf[64]{};
-    if (mciSendStringW(L"status okmusic mode", buf, 64, nullptr) != 0) { return L""; }
-    return buf;
-}
+// Songs play through Windows Media Foundation's simple player (MFPlay): Windows' old MCI
+// player refused the mp3s inside the game ("A problem occurred in initializing MCI").
 static DWORD WINAPI MusicWorker(LPVOID)
 {
-    // Windows' mp3 player (MCI "mpegvideo") runs on DirectShow, which needs COM on this thread
     const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    // ...and a message queue and a window of its own, which DirectShow's player talks through
+    // the player talks to this thread through its message queue
     MSG msg;
     PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
-    HWND musicWnd = CreateWindowExW(0, L"STATIC", L"OverkillCoopJukebox", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, nullptr, nullptr);
-    Log("Jukebox: started (COM %s, window %s)", SUCCEEDED(com) ? "ready" : "failed", musicWnd ? "ready" : "failed");
+    Log("Jukebox: started (Media Foundation player, COM %s)", SUCCEEDED(com) ? "ready" : "failed");
     int failCount = 0;
     ULONGLONG retryAt = 0;
     const std::wstring cmdPath = g_ExeDir + L"\\overkill_music.txt";
@@ -2132,40 +2128,52 @@ static DWORD WINAPI MusicWorker(LPVOID)
     long lastGen = -1;
     std::vector<std::wstring> tracks;
     int index = 0;
-    bool opened = false, started = false, focusPaused = false;
+    IMFPMediaPlayer* player = nullptr;
+    bool started = false;
+    ULONGLONG openedAt = 0;
     std::string state = "stop", lastText;
     int volume = -1, appliedVolume = -1;
-    auto closeSong = [&]() { if (opened) { mciSendStringW(L"close okmusic", nullptr, 0, nullptr); } opened = false; started = false; };
+    auto closeSong = [&]() {
+        if (player) { player->Shutdown(); player->Release(); player = nullptr; }
+        started = false;
+    };
     auto openTrack = [&](int i) -> bool {
         closeSong();
         if (tracks.empty()) { return false; }
         index = ((i % int(tracks.size())) + int(tracks.size())) % int(tracks.size());
         if (GetTickCount64() < retryAt) { return false; }
-        const std::wstring cmd = L"open \"" + tracks[size_t(index)] + L"\" type mpegvideo alias okmusic";
-        MCIERROR err = mciSendStringW(cmd.c_str(), nullptr, 0, nullptr);
-        if (err != 0)
+        const HRESULT hr = MFPCreateMediaPlayer(tracks[size_t(index)].c_str(), FALSE, MFP_OPTION_NONE, nullptr, nullptr, &player);
+        if (FAILED(hr) || !player)
         {
-            // let Windows pick the player from the file type instead
-            const std::wstring cmd2 = L"open \"" + tracks[size_t(index)] + L"\" alias okmusic";
-            err = mciSendStringW(cmd2.c_str(), nullptr, 0, nullptr);
-        }
-        if (err != 0)
-        {
-            wchar_t msg[256]{};
-            mciGetErrorStringW(err, msg, 256);
+            if (player) { player->Release(); player = nullptr; }
             ++failCount;
-            // wait before trying again (5 s, then 30 s), and only log the first few
             retryAt = GetTickCount64() + (failCount < 3 ? 5000 : 30000);
-            if (failCount <= 3) { Log("Jukebox: couldn't open song %d: %ls (try %d)", index + 1, msg, failCount); }
+            if (failCount <= 3) { Log("Jukebox: couldn't open song %d (error 0x%08lX, try %d)", index + 1, (unsigned long)hr, failCount); }
             return false;
         }
-        failCount = 0;
-        retryAt = 0;
-        opened = true;
+        openedAt = GetTickCount64();
         appliedVolume = -1;
         Log("Jukebox: song %d of %zu", index + 1, tracks.size());
         if (FILE* f = _wfopen(statusPath.c_str(), L"w")) { std::fprintf(f, "index=%d\n", index); std::fclose(f); }
         return true;
+    };
+    auto playerState = [&]() -> MFP_MEDIAPLAYER_STATE {
+        MFP_MEDIAPLAYER_STATE st = MFP_MEDIAPLAYER_STATE_EMPTY;
+        if (player) { player->GetState(&st); }
+        return st;
+    };
+    // how far into the song, and how long it is (100-ns units), or false if not known yet
+    auto songTimes = [&](LONGLONG& pos, LONGLONG& len) -> bool {
+        if (!player) { return false; }
+        PROPVARIANT p1, p2;
+        PropVariantInit(&p1);
+        PropVariantInit(&p2);
+        bool ok = SUCCEEDED(player->GetPosition(GUID_NULL, &p1)) && SUCCEEDED(player->GetDuration(GUID_NULL, &p2))
+            && p1.vt == VT_I8 && p2.vt == VT_I8;
+        if (ok) { pos = p1.hVal.QuadPart; len = p2.hVal.QuadPart; }
+        PropVariantClear(&p1);
+        PropVariantClear(&p2);
+        return ok;
     };
     for (;;)
     {
@@ -2217,7 +2225,7 @@ static DWORD WINAPI MusicWorker(LPVOID)
                 const bool listChanged = newTracks != tracks;
                 tracks = newTracks;
                 if (state == "stop") { closeSong(); }
-                else if (listChanged || !opened || wantIndex != index) { openTrack(wantIndex); }
+                else if (listChanged || !player || wantIndex != index) { openTrack(wantIndex); }
             }
             if (state == "stop") { closeSong(); }
         }
@@ -2226,30 +2234,42 @@ static DWORD WINAPI MusicWorker(LPVOID)
         GetWindowThreadProcessId(GetForegroundWindow(), &fgPid);
         const bool focused = fgPid == GetCurrentProcessId();
         const bool want = state == "play" && focused;
-        if (state != "stop" && !opened && !tracks.empty()) { openTrack(index); }
-        if (!opened) { continue; }
+        if (state != "stop" && !player && !tracks.empty()) { openTrack(index); }
+        if (!player) { continue; }
+        const MFP_MEDIAPLAYER_STATE st = playerState();
+        // the file never loaded: give up on it for a while
+        if (st == MFP_MEDIAPLAYER_STATE_EMPTY && !started && GetTickCount64() - openedAt > 8000)
+        {
+            ++failCount;
+            retryAt = GetTickCount64() + (failCount < 3 ? 5000 : 30000);
+            if (failCount <= 3) { Log("Jukebox: song %d never loaded (try %d)", index + 1, failCount); }
+            closeSong();
+            continue;
+        }
+        if (st == MFP_MEDIAPLAYER_STATE_EMPTY) { continue; }  // still loading
         if (volume >= 0 && volume != appliedVolume)
         {
-            const std::wstring cmd = L"setaudio okmusic volume to " + std::to_wstring(volume * 10);
-            mciSendStringW(cmd.c_str(), nullptr, 0, nullptr);
+            player->SetVolume(float(volume) / 100.0f);
             appliedVolume = volume;
         }
-        const std::wstring mode = MciStatus();
+        LONGLONG at = 0, len = 0;
+        const bool ended = started && (st == MFP_MEDIAPLAYER_STATE_STOPPED
+            || (songTimes(at, len) && len > 0 && at >= len - 2000000));
         if (want)
         {
-            if (mode == L"stopped" && started)
+            if (ended)
             {
-                // song over: the next one
-                if (openTrack(index + 1)) { mciSendStringW(L"play okmusic", nullptr, 0, nullptr); started = true; }
+                // song over: the next one (it starts playing once it has loaded)
+                if (openTrack(index + 1)) { started = false; }
             }
-            else if (mode == L"paused") { mciSendStringW(L"resume okmusic", nullptr, 0, nullptr); }
-            else if (mode == L"stopped" || !started) { mciSendStringW(L"play okmusic", nullptr, 0, nullptr); started = true; }
-            if (focusPaused) { focusPaused = false; }
+            else if (st != MFP_MEDIAPLAYER_STATE_PLAYING)
+            {
+                if (SUCCEEDED(player->Play())) { started = true; }
+            }
         }
-        else if (mode == L"playing")
+        else if (st == MFP_MEDIAPLAYER_STATE_PLAYING)
         {
-            mciSendStringW(L"pause okmusic", nullptr, 0, nullptr);
-            focusPaused = state == "play";
+            player->Pause();
         }
     }
 }

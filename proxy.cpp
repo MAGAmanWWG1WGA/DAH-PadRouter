@@ -86,7 +86,8 @@ struct Config
     bool Enabled = true;
     int HidePadIndex = 1;          // XInput slot of Player 2's pad (0 = first pad)
     int P2ControllerId = 1;        // Unreal ControllerId of Player 2 (DAH2P creates it with 1)
-    bool RouteExtraPads = true;    // pads 3 and 4 drive Players 3 and 4 (their PlayerInput from the handshake)
+    bool RouteExtraPads = true;
+    bool HideExtraPads = true;     // pads 3 and 4 never reach the game directly (they drove Player 1)    // pads 3 and 4 drive Players 3 and 4 (their PlayerInput from the handshake)
     int InputKeySlot = 0;          // found by the probe; 0 = not set (pad is only hidden)
     int InputAxisSlot = 0;         // found by the probe
     int ViewportClientOffset = 0;  // 0 = auto-detect the FViewportClient part of the viewport object
@@ -163,6 +164,7 @@ static void LoadConfig()
         else if (key == "HidePadIndex") { g_Cfg.HidePadIndex = int(v); }
         else if (key == "P2ControllerId") { g_Cfg.P2ControllerId = int(v); }
         else if (key == "RouteExtraPads") { g_Cfg.RouteExtraPads = v != 0; }
+        else if (key == "HideExtraPads") { g_Cfg.HideExtraPads = v != 0; }
         else if (key == "InputKeySlot") { g_Cfg.InputKeySlot = int(v); }
         else if (key == "InputAxisSlot") { g_Cfg.InputAxisSlot = int(v); }
         else if (key == "ViewportClientOffset") { g_Cfg.ViewportClientOffset = int(v); }
@@ -769,6 +771,13 @@ extern "C" DWORD WINAPI Proxy_XInputGetState(DWORD userIndex, XINPUT_STATE* stat
         }
         return state ? ERROR_SUCCESS : result;
     }
+    // Pads 3 and 4 with no Player 3 / 4 in the game: the game must not read them as Player 1
+    if ((userIndex == 2 || userIndex == 3) && g_Cfg.HideExtraPads && result == ERROR_SUCCESS && state)
+    {
+        state->Gamepad = XINPUT_GAMEPAD{};
+        state->dwPacketNumber = 1;
+        return result;
+    }
     if (int(userIndex) != g_Cfg.HidePadIndex) { return result; }
 
     if (!g_Enabled)
@@ -847,7 +856,8 @@ extern "C" DWORD WINAPI Proxy_XInputGetStateEx(DWORD userIndex, XINPUT_STATE* st
         state->dwPacketNumber = 1;
         return ERROR_SUCCESS;
     }
-    if (int(userIndex) == g_Cfg.HidePadIndex && g_Enabled && result == ERROR_SUCCESS && state)
+    if (((int(userIndex) == g_Cfg.HidePadIndex && g_Enabled) || ((userIndex == 2 || userIndex == 3) && g_Cfg.HideExtraPads))
+        && result == ERROR_SUCCESS && state)
     {
         state->Gamepad = XINPUT_GAMEPAD{};
         state->dwPacketNumber = 1;

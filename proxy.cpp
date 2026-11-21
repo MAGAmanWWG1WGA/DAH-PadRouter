@@ -23,6 +23,8 @@
 #include <Xinput.h>
 #include <mmsystem.h>
 #pragma comment(lib, "winmm.lib")
+#include <objbase.h>
+#pragma comment(lib, "ole32.lib")
 #include <intrin.h>
 
 #include <algorithm>
@@ -394,6 +396,8 @@ static std::atomic<uintptr_t> g_InputVTable{0};
 static std::atomic<PIKeyFn> g_PIKey{nullptr};
 static std::atomic<PIAxisFn> g_PIAxis{nullptr};
 static std::atomic<bool> g_ResetPad{false};
+static std::atomic<int> g_SkinRequest{0};          // Select + D-pad left/right on pad 2: -1 / +1 (skin change)
+static std::atomic<ULONGLONG> g_IgnoreP2Until{0};  // after a drop-out: don't take Player 2's input address from the handshake
 static std::atomic<bool> g_DropRequested{false};   // Start held 2 s on pad 2 while Player 2 exists
 static std::atomic<bool> g_SpawnRequested{false};  // Start pressed on pad 2 while Player 2 doesn't exist   // Player 2 changed: forget held buttons without sending
 
@@ -703,7 +707,14 @@ extern "C" DWORD WINAPI Proxy_XInputGetState(DWORD userIndex, XINPUT_STATE* stat
         {
             const ULONGLONG nowMs = GetTickCount64();
             if (!startHeldSince) { startHeldSince = nowMs; }
-            else if (!dropSent && nowMs - startHeldSince >= 2000) { g_DropRequested = true; dropSent = true; }
+            else if (!dropSent && nowMs - startHeldSince >= 2000)
+            {
+                g_DropRequested = true; dropSent = true;
+                // stop feeding Player 2 now: the Lua mod is about to remove that player
+                g_IgnoreP2Until = nowMs + 3000;
+                g_P2Input = 0;
+                g_ResetPad = true;
+            }
         }
         else { startHeldSince = 0; dropSent = false; }
     }
@@ -714,6 +725,18 @@ extern "C" DWORD WINAPI Proxy_XInputGetState(DWORD userIndex, XINPUT_STATE* stat
         pad = state->Gamepad;
         state->Gamepad = XINPUT_GAMEPAD{};  // the game sees a connected pad that is never touched
         state->dwPacketNumber = 1;
+    }
+    // Select held on pad 2: the D-pad changes Player 2's skin and never reaches the game, so
+    // a skin change can't also fire the D-pad's own action
+    if (connected && fromGame && (pad.wButtons & XINPUT_GAMEPAD_BACK))
+    {
+        static bool leftWas = false, rightWas = false;
+        const bool l = (pad.wButtons & XINPUT_GAMEPAD_DPAD_LEFT) != 0;
+        const bool r = (pad.wButtons & XINPUT_GAMEPAD_DPAD_RIGHT) != 0;
+        if (l && !leftWas) { g_SkinRequest = -1; }
+        if (r && !rightWas) { g_SkinRequest = 1; }
+        leftWas = l; rightWas = r;
+        pad.wButtons &= ~WORD(XINPUT_GAMEPAD_DPAD_UP | XINPUT_GAMEPAD_DPAD_DOWN | XINPUT_GAMEPAD_DPAD_LEFT | XINPUT_GAMEPAD_DPAD_RIGHT);
     }
     if (fromGame && InjectionReady()) { RoutePad(connected ? &pad : nullptr); }
     return result;
@@ -1664,6 +1687,7 @@ static void ApplyHandshake()
     else { Log("WARNING: some key names missing from the handshake; routing stays off"); }
 
     // Player 1's / Player 2's PlayerInput objects (both use the same class, so one vtable).
+    if (GetTickCount64() < g_IgnoreP2Until.load()) { p2input = 0; }
     if (p1input != g_P1Input.load() || p2input != g_P2Input.load())
     {
         uintptr_t vt{};
@@ -2008,6 +2032,16 @@ static DWORD WINAPI Worker(LPVOID)
                 g_Cfg.HidePadIndex);
         }
 
+        // Pass a skin change (Select + D-pad on pad 2) the same way
+        if (const int dir = g_SkinRequest.exchange(0))
+        {
+            const std::wstring paths[] = {L"padrouter_skin_request.txt", g_ExeDir + L"\\ue4ss\\padrouter_skin_request.txt"};
+            for (const auto& path : paths)
+            {
+                if (FILE* f = _wfopen(path.c_str(), L"a")) { std::fputs(dir > 0 ? "next\n" : "prev\n", f); std::fclose(f); break; }
+            }
+        }
+
         // Pass a "Player 2 drops out" request the same way
         if (g_DropRequested.exchange(false))
         {
@@ -2084,6 +2118,11 @@ static std::wstring MciStatus()
 }
 static DWORD WINAPI MusicWorker(LPVOID)
 {
+    // Windows' mp3 player (MCI "mpegvideo") runs on DirectShow, which needs COM on this thread
+    const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    Log("Jukebox: started (COM %s)", SUCCEEDED(com) ? "ready" : "failed");
+    int failCount = 0;
+    ULONGLONG retryAt = 0;
     const std::wstring cmdPath = g_ExeDir + L"\\overkill_music.txt";
     const std::wstring statusPath = g_ExeDir + L"\\overkill_music_status.txt";
     long lastGen = -1;
@@ -2097,15 +2136,27 @@ static DWORD WINAPI MusicWorker(LPVOID)
         closeSong();
         if (tracks.empty()) { return false; }
         index = ((i % int(tracks.size())) + int(tracks.size())) % int(tracks.size());
+        if (GetTickCount64() < retryAt) { return false; }
         const std::wstring cmd = L"open \"" + tracks[size_t(index)] + L"\" type mpegvideo alias okmusic";
-        const MCIERROR err = mciSendStringW(cmd.c_str(), nullptr, 0, nullptr);
+        MCIERROR err = mciSendStringW(cmd.c_str(), nullptr, 0, nullptr);
+        if (err != 0)
+        {
+            // let Windows pick the player from the file type instead
+            const std::wstring cmd2 = L"open \"" + tracks[size_t(index)] + L"\" alias okmusic";
+            err = mciSendStringW(cmd2.c_str(), nullptr, 0, nullptr);
+        }
         if (err != 0)
         {
             wchar_t msg[256]{};
             mciGetErrorStringW(err, msg, 256);
-            Log("Jukebox: couldn't open song %d: %ls", index + 1, msg);
+            ++failCount;
+            // wait before trying again (5 s, then 30 s), and only log the first few
+            retryAt = GetTickCount64() + (failCount < 3 ? 5000 : 30000);
+            if (failCount <= 3) { Log("Jukebox: couldn't open song %d: %ls (try %d)", index + 1, msg, failCount); }
             return false;
         }
+        failCount = 0;
+        retryAt = 0;
         opened = true;
         appliedVolume = -1;
         Log("Jukebox: song %d of %zu", index + 1, tracks.size());
@@ -2150,6 +2201,7 @@ static DWORD WINAPI MusicWorker(LPVOID)
             if (gen != lastGen)
             {
                 lastGen = gen;
+                failCount = 0; retryAt = 0;  // a new command from the trainer: try straight away
                 const bool listChanged = newTracks != tracks;
                 tracks = newTracks;
                 if (state == "stop") { closeSong(); }

@@ -21,6 +21,8 @@
 #define WINVER 0x0A00
 #include <Windows.h>
 #include <Xinput.h>
+#include <mmsystem.h>
+#pragma comment(lib, "winmm.lib")
 #include <intrin.h>
 
 #include <algorithm>
@@ -2029,8 +2031,152 @@ static DWORD WINAPI Worker(LPVOID)
     }
 }
 
+// ============================================================================
+// Jukebox (Third Eye: Overkill Co-op)
+// ----------------------------------------------------------------------------
+// The Lua mod writes overkill_music.txt next to the exe:
+//   gen=<n>  state=play|pause|stop  volume=<0-100>  index=<0-based>  track=<path> (one per song)
+// A new gen means "start index's song"; the same gen only changes play/pause/volume. Songs play
+// through Windows' own player (MCI), one after another, round and round, and pause while the
+// game isn't the window in front. overkill_music_status.txt says which song is on.
+// Only one copy of this runs, however many of the xinput DLLs the game loads.
+// ============================================================================
+static std::wstring Utf8ToWide(const std::string& s)
+{
+    if (s.empty()) { return std::wstring(); }
+    const int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), nullptr, 0);
+    std::wstring w(size_t(n), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), &w[0], n);
+    return w;
+}
+static std::wstring MciStatus()
+{
+    wchar_t buf[64]{};
+    if (mciSendStringW(L"status okmusic mode", buf, 64, nullptr) != 0) { return L""; }
+    return buf;
+}
+static DWORD WINAPI MusicWorker(LPVOID)
+{
+    const std::wstring cmdPath = g_ExeDir + L"\\overkill_music.txt";
+    const std::wstring statusPath = g_ExeDir + L"\\overkill_music_status.txt";
+    long lastGen = -1;
+    std::vector<std::wstring> tracks;
+    int index = 0;
+    bool opened = false, started = false, focusPaused = false;
+    std::string state = "stop", lastText;
+    int volume = -1, appliedVolume = -1;
+    auto closeSong = [&]() { if (opened) { mciSendStringW(L"close okmusic", nullptr, 0, nullptr); } opened = false; started = false; };
+    auto openTrack = [&](int i) -> bool {
+        closeSong();
+        if (tracks.empty()) { return false; }
+        index = ((i % int(tracks.size())) + int(tracks.size())) % int(tracks.size());
+        const std::wstring cmd = L"open \"" + tracks[size_t(index)] + L"\" type mpegvideo alias okmusic";
+        const MCIERROR err = mciSendStringW(cmd.c_str(), nullptr, 0, nullptr);
+        if (err != 0)
+        {
+            wchar_t msg[256]{};
+            mciGetErrorStringW(err, msg, 256);
+            Log("Jukebox: couldn't open song %d: %ls", index + 1, msg);
+            return false;
+        }
+        opened = true;
+        appliedVolume = -1;
+        Log("Jukebox: song %d of %zu", index + 1, tracks.size());
+        if (FILE* f = _wfopen(statusPath.c_str(), L"w")) { std::fprintf(f, "index=%d\n", index); std::fclose(f); }
+        return true;
+    };
+    for (;;)
+    {
+        Sleep(250);
+        // read the Lua mod's command file (only when it changed)
+        std::string text;
+        if (FILE* f = _wfopen(cmdPath.c_str(), L"rb"))
+        {
+            char buf[4096];
+            size_t n;
+            while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0) { text.append(buf, n); }
+            std::fclose(f);
+        }
+        if (!text.empty() && text != lastText)
+        {
+            lastText = text;
+            long gen = lastGen;
+            int wantIndex = index;
+            std::vector<std::wstring> newTracks;
+            size_t pos = 0;
+            while (pos < text.size())
+            {
+                size_t end = text.find('\n', pos);
+                if (end == std::string::npos) { end = text.size(); }
+                std::string line = text.substr(pos, end - pos);
+                pos = end + 1;
+                while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) { line.pop_back(); }
+                const size_t eq = line.find('=');
+                if (eq == std::string::npos) { continue; }
+                const std::string key = line.substr(0, eq), val = line.substr(eq + 1);
+                if (key == "gen") { gen = std::strtol(val.c_str(), nullptr, 10); }
+                else if (key == "state") { state = val; }
+                else if (key == "volume") { volume = std::clamp(int(std::strtol(val.c_str(), nullptr, 10)), 0, 100); }
+                else if (key == "index") { wantIndex = int(std::strtol(val.c_str(), nullptr, 10)); }
+                else if (key == "track") { newTracks.push_back(Utf8ToWide(val)); }
+            }
+            if (gen != lastGen)
+            {
+                lastGen = gen;
+                const bool listChanged = newTracks != tracks;
+                tracks = newTracks;
+                if (state == "stop") { closeSong(); }
+                else if (listChanged || !opened || wantIndex != index) { openTrack(wantIndex); }
+            }
+            if (state == "stop") { closeSong(); }
+        }
+        // pause while the game isn't the window in front
+        DWORD fgPid = 0;
+        GetWindowThreadProcessId(GetForegroundWindow(), &fgPid);
+        const bool focused = fgPid == GetCurrentProcessId();
+        const bool want = state == "play" && focused;
+        if (state != "stop" && !opened && !tracks.empty()) { openTrack(index); }
+        if (!opened) { continue; }
+        if (volume >= 0 && volume != appliedVolume)
+        {
+            const std::wstring cmd = L"setaudio okmusic volume to " + std::to_wstring(volume * 10);
+            mciSendStringW(cmd.c_str(), nullptr, 0, nullptr);
+            appliedVolume = volume;
+        }
+        const std::wstring mode = MciStatus();
+        if (want)
+        {
+            if (mode == L"stopped" && started)
+            {
+                // song over: the next one
+                if (openTrack(index + 1)) { mciSendStringW(L"play okmusic", nullptr, 0, nullptr); started = true; }
+            }
+            else if (mode == L"paused") { mciSendStringW(L"resume okmusic", nullptr, 0, nullptr); }
+            else if (mode == L"stopped" || !started) { mciSendStringW(L"play okmusic", nullptr, 0, nullptr); started = true; }
+            if (focusPaused) { focusPaused = false; }
+        }
+        else if (mode == L"playing")
+        {
+            mciSendStringW(L"pause okmusic", nullptr, 0, nullptr);
+            focusPaused = state == "play";
+        }
+    }
+}
+static void StartMusic()
+{
+    // one jukebox per game, even if the game loads more than one of the xinput DLLs
+    wchar_t name[64];
+    std::swprintf(name, 64, L"OverkillCoopJukebox_%lu", GetCurrentProcessId());
+    HANDLE m = CreateMutexW(nullptr, TRUE, name);
+    if (!m) { return; }
+    if (GetLastError() == ERROR_ALREADY_EXISTS) { CloseHandle(m); return; }
+    HANDLE h = CreateThread(nullptr, 0, &MusicWorker, nullptr, 0, nullptr);
+    if (h) { CloseHandle(h); }
+}
+
 static void StartWorker()
 {
+    StartMusic();
     HANDLE h = CreateThread(nullptr, 0, &Worker, nullptr, 0, nullptr);
     if (h) { CloseHandle(h); }
 }

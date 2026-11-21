@@ -394,6 +394,7 @@ static std::atomic<uintptr_t> g_InputVTable{0};
 static std::atomic<PIKeyFn> g_PIKey{nullptr};
 static std::atomic<PIAxisFn> g_PIAxis{nullptr};
 static std::atomic<bool> g_ResetPad{false};
+static std::atomic<bool> g_DropRequested{false};   // Start held 2 s on pad 2 while Player 2 exists
 static std::atomic<bool> g_SpawnRequested{false};  // Start pressed on pad 2 while Player 2 doesn't exist   // Player 2 changed: forget held buttons without sending
 
 static std::atomic<uintptr_t> g_ViewportObj{0};
@@ -567,6 +568,7 @@ static void RoutePad(const XINPUT_GAMEPAD* pad)
     {
         ComputeButtons(*pad, buttons);
         ComputeAxes(*pad, axes);
+        buttons[BK_Start] = false;   // Player 2 doesn't get the pause menu (hold Start = drop out)
     }
 
     LARGE_INTEGER now{}, freq{};
@@ -691,6 +693,20 @@ extern "C" DWORD WINAPI Proxy_XInputGetState(DWORD userIndex, XINPUT_STATE* stat
     const bool startDown = connected && (state->Gamepad.wButtons & XINPUT_GAMEPAD_START) != 0;
     if (fromGame && startDown && !startWasDown && !g_P2Input.load()) { g_SpawnRequested = true; }
     startWasDown = startDown;
+    // Player 2's Start never reaches the game (so Player 2 can't pause it for both);
+    // holding it for 2 seconds asks the Lua mod to take Player 2 out (drop out).
+    static ULONGLONG startHeldSince = 0;
+    static bool dropSent = false;
+    if (fromGame)
+    {
+        if (startDown && g_P2Input.load())
+        {
+            const ULONGLONG nowMs = GetTickCount64();
+            if (!startHeldSince) { startHeldSince = nowMs; }
+            else if (!dropSent && nowMs - startHeldSince >= 2000) { g_DropRequested = true; dropSent = true; }
+        }
+        else { startHeldSince = 0; dropSent = false; }
+    }
 
     XINPUT_GAMEPAD pad{};
     if (connected)
@@ -1990,6 +2006,17 @@ static DWORD WINAPI Worker(LPVOID)
             }
             Log(written ? "Start on pad %d: asked DAH2P to spawn Player 2" : "Start on pad %d: could not write the spawn request",
                 g_Cfg.HidePadIndex);
+        }
+
+        // Pass a "Player 2 drops out" request the same way
+        if (g_DropRequested.exchange(false))
+        {
+            const std::wstring paths[] = {L"padrouter_dropout_request.txt", g_ExeDir + L"\\ue4ss\\padrouter_dropout_request.txt"};
+            for (const auto& path : paths)
+            {
+                if (FILE* f = _wfopen(path.c_str(), L"w")) { std::fputs("dropout\n", f); std::fclose(f); break; }
+            }
+            Log("Start held on pad %d: asked the Lua mod to drop Player 2 out", g_Cfg.HidePadIndex);
         }
 
         const bool chord = GameHasFocus() && Down(VK_CONTROL) && Down(VK_SHIFT);

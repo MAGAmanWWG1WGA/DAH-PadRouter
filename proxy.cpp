@@ -2120,7 +2120,11 @@ static DWORD WINAPI MusicWorker(LPVOID)
 {
     // Windows' mp3 player (MCI "mpegvideo") runs on DirectShow, which needs COM on this thread
     const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    Log("Jukebox: started (COM %s)", SUCCEEDED(com) ? "ready" : "failed");
+    // ...and a message queue and a window of its own, which DirectShow's player talks through
+    MSG msg;
+    PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+    HWND musicWnd = CreateWindowExW(0, L"STATIC", L"OverkillCoopJukebox", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, nullptr, nullptr);
+    Log("Jukebox: started (COM %s, window %s)", SUCCEEDED(com) ? "ready" : "failed", musicWnd ? "ready" : "failed");
     int failCount = 0;
     ULONGLONG retryAt = 0;
     const std::wstring cmdPath = g_ExeDir + L"\\overkill_music.txt";
@@ -2165,7 +2169,15 @@ static DWORD WINAPI MusicWorker(LPVOID)
     };
     for (;;)
     {
-        Sleep(250);
+        // wait a quarter second, handling the player's messages meanwhile
+        const ULONGLONG waitUntil = GetTickCount64() + 250;
+        for (;;)
+        {
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
+            const ULONGLONG nowW = GetTickCount64();
+            if (nowW >= waitUntil) { break; }
+            MsgWaitForMultipleObjects(0, nullptr, FALSE, DWORD(waitUntil - nowW), QS_ALLINPUT);
+        }
         // read the Lua mod's command file (only when it changed)
         std::string text;
         if (FILE* f = _wfopen(cmdPath.c_str(), L"rb"))

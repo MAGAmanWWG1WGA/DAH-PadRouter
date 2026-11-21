@@ -86,7 +86,8 @@ struct Config
     bool Enabled = true;
     int HidePadIndex = 1;          // XInput slot of Player 2's pad (0 = first pad)
     int P2ControllerId = 1;        // Unreal ControllerId of Player 2 (DAH2P creates it with 1)
-    bool RouteExtraPads = true;    // pads 3 and 4 drive Players 3 and 4 (their PlayerInput from the handshake)
+    bool RouteExtraPads = true;
+    bool HideExtraPads = true;     // pads 3 and 4 never reach the game directly (they drove Player 1)    // pads 3 and 4 drive Players 3 and 4 (their PlayerInput from the handshake)
     int InputKeySlot = 0;          // found by the probe; 0 = not set (pad is only hidden)
     int InputAxisSlot = 0;         // found by the probe
     int ViewportClientOffset = 0;  // 0 = auto-detect the FViewportClient part of the viewport object
@@ -163,6 +164,7 @@ static void LoadConfig()
         else if (key == "HidePadIndex") { g_Cfg.HidePadIndex = int(v); }
         else if (key == "P2ControllerId") { g_Cfg.P2ControllerId = int(v); }
         else if (key == "RouteExtraPads") { g_Cfg.RouteExtraPads = v != 0; }
+        else if (key == "HideExtraPads") { g_Cfg.HideExtraPads = v != 0; }
         else if (key == "InputKeySlot") { g_Cfg.InputKeySlot = int(v); }
         else if (key == "InputAxisSlot") { g_Cfg.InputAxisSlot = int(v); }
         else if (key == "ViewportClientOffset") { g_Cfg.ViewportClientOffset = int(v); }
@@ -585,6 +587,24 @@ struct ExtraRoute
 };
 static ExtraRoute g_Extra[2];                        // [0] = Player 3 (pad slot 2), [1] = Player 4 (pad slot 3)
 static std::atomic<int> g_SkinRequestX[2] = {0, 0};  // Select + D-pad on pads 3 / 4
+static std::atomic<int> g_PartyRequest[2] = {0, 0};  // pads 3 / 4: 1 = Start (join), 2 = Start held 2 s (drop out)
+
+// Start on pad 3 / 4: join when that player isn't in, hold 2 s to drop out (game thread only)
+static void PartyStart(int which, bool inGame, bool startDown)
+{
+    static bool was[2]{};
+    static ULONGLONG since[2]{};
+    static bool sent[2]{};
+    if (startDown && !was[which] && !inGame) { g_PartyRequest[which] = 1; }
+    if (startDown && inGame)
+    {
+        const ULONGLONG now = GetTickCount64();
+        if (!since[which]) { since[which] = now; }
+        else if (!sent[which] && now - since[which] >= 2000) { g_PartyRequest[which] = 2; sent[which] = true; }
+    }
+    else { since[which] = 0; sent[which] = false; }
+    was[which] = startDown;
+}
 
 static void RouteExtraPad(int which, uintptr_t input, const XINPUT_GAMEPAD* pad)
 {
@@ -763,11 +783,20 @@ extern "C" DWORD WINAPI Proxy_XInputGetState(DWORD userIndex, XINPUT_STATE* stat
             ZeroMemory(state, sizeof(XINPUT_STATE));
             state->dwPacketNumber = 1;
         }
+        if (CalledByGame(caller)) { PartyStart(which, true, connected && (pad.wButtons & XINPUT_GAMEPAD_START) != 0); }
         if (g_Cfg.RouteExtraPads && CalledByGame(caller) && g_NamesReady && !g_Probing && g_PIKey.load() && PlayerInputValid(input))
         {
             RouteExtraPad(which, input, connected ? &pad : nullptr);
         }
         return state ? ERROR_SUCCESS : result;
+    }
+    // Pads 3 and 4 with no Player 3 / 4 in the game: the game must not read them as Player 1
+    if ((userIndex == 2 || userIndex == 3) && g_Cfg.HideExtraPads && result == ERROR_SUCCESS && state)
+    {
+        if (CalledByGame(caller)) { PartyStart(int(userIndex) - 2, false, (state->Gamepad.wButtons & XINPUT_GAMEPAD_START) != 0); }
+        state->Gamepad = XINPUT_GAMEPAD{};
+        state->dwPacketNumber = 1;
+        return result;
     }
     if (int(userIndex) != g_Cfg.HidePadIndex) { return result; }
 
@@ -847,7 +876,8 @@ extern "C" DWORD WINAPI Proxy_XInputGetStateEx(DWORD userIndex, XINPUT_STATE* st
         state->dwPacketNumber = 1;
         return ERROR_SUCCESS;
     }
-    if (int(userIndex) == g_Cfg.HidePadIndex && g_Enabled && result == ERROR_SUCCESS && state)
+    if (((int(userIndex) == g_Cfg.HidePadIndex && g_Enabled) || ((userIndex == 2 || userIndex == 3) && g_Cfg.HideExtraPads))
+        && result == ERROR_SUCCESS && state)
     {
         state->Gamepad = XINPUT_GAMEPAD{};
         state->dwPacketNumber = 1;
@@ -2151,6 +2181,20 @@ static DWORD WINAPI Worker(LPVOID)
         }
         for (int which = 0; which < 2; ++which)
         {
+            if (const int req = g_PartyRequest[which].exchange(0))
+            {
+                const std::wstring paths[] = {L"padrouter_party_request.txt", g_ExeDir + L"\\ue4ss\\padrouter_party_request.txt"};
+                for (const auto& path : paths)
+                {
+                    if (FILE* f = _wfopen(path.c_str(), L"a"))
+                    {
+                        std::fprintf(f, "%s%d\n", req == 1 ? "join" : "drop", which + 3);
+                        std::fclose(f);
+                        break;
+                    }
+                }
+                Log("Start on pad %d: Player %d %s", which + 3, which + 3, req == 1 ? "join request" : "drop-out request");
+            }
             if (const int dir = g_SkinRequestX[which].exchange(0))
             {
                 const std::wstring paths[] = {L"padrouter_skin_request.txt", g_ExeDir + L"\\ue4ss\\padrouter_skin_request.txt"};
